@@ -1,4 +1,5 @@
 # yimao_plugin/handlers.py
+
 import asyncio
 import json
 import logging
@@ -8,15 +9,18 @@ import shutil
 import re
 import httpx
 import datetime
+from urllib.parse import urlparse, urlunparse
 from pathlib import Path
 from typing import Literal
 
 from jmcomic import create_option_by_file, download_album, JmcomicClient
 from jmcomic.jm_exception import MissingAlbumPhotoException, PartialDownloadFailedException
 
+from nonebot import on_message
+from nonebot.rule import Rule
 from nonebot.matcher import Matcher
 from nonebot.params import CommandArg
-from nonebot.adapters.onebot.v11 import Bot, Event, Message, GroupMessageEvent
+from nonebot.adapters.onebot.v11 import Bot, Event, Message, GroupMessageEvent, MessageSegment
 
 from . import config, data_store, llm_client, tools, utils
 
@@ -431,3 +435,71 @@ async def update_summary_for_group(group_id: str, history_list: list):
             data_store.update_group_summary(group_id, new_summary)
     except Exception as e:
         logger.error(f"为群组 {group_id} 生成摘要时出错: {e}")
+    
+
+
+def is_bilibili_card() -> Rule:
+    """
+    它会检查消息段中是否包含json类型，并且json内容中包含B站小程序的固定AppID '1109937557'。
+    """
+    async def _checker(event: GroupMessageEvent) -> bool:
+        if not isinstance(event, GroupMessageEvent):
+            return False
+        
+        for seg in event.message:
+            if seg.type == "json":
+                try:
+                    json_data = json.loads(seg.data.get("data", "{}"))
+                    
+                    if json_data.get("meta", {}).get("detail_1", {}).get("appid") == "1109937557":
+                        return True
+                except (json.JSONDecodeError, AttributeError):
+                    continue
+        return False
+    return Rule(_checker)
+
+async def expand_b23_url(short_url: str) -> str:
+    """
+    访问短链接，返回长链接。
+    """
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            head_response = await client.head(short_url, timeout=10.0)
+            long_url_with_params = str(head_response.url)
+            
+            parsed_url = urlparse(long_url_with_params)
+            
+            clean_url = urlunparse(parsed_url._replace(params='', query='', fragment=''))
+            
+            return clean_url
+            
+    except Exception as e:
+        logger.error(f"展开或净化B站短链接 {short_url} 时出错: {e}")
+        return short_url
+
+bili_card_parser = on_message(rule=is_bilibili_card(), priority=20, block=False)
+
+@bili_card_parser.handle()
+async def handle_bili_card(bot: Bot, event: GroupMessageEvent, matcher: Matcher):
+    for seg in event.message:
+        if seg.type == "json":
+            try:
+                json_data = json.loads(seg.data.get("data", "{}"))
+                short_url = json_data.get("meta", {}).get("detail_1", {}).get("qqdocurl")
+                
+                if short_url:
+                    long_url = await expand_b23_url(short_url)
+                    
+                    reply_text = long_url
+                    
+                    reply_segment = MessageSegment.reply(id_=event.message_id)
+                    text_segment = MessageSegment.text(reply_text)
+                    message_to_send = Message([reply_segment, text_segment])
+                    
+                    logger.info(f"成功解析并展开B站链接: {short_url} -> {long_url}")
+                    await matcher.send(message_to_send)
+                    
+                    return
+
+            except Exception as e:
+                logger.error(f"解析B站小程序时出错: {e}", exc_info=True)
