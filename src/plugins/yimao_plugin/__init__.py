@@ -38,40 +38,38 @@ async def on_shutdown():
     data_store.save_group_summaries_to_file()
     logger.info("用户记忆和群组摘要已保存。")
 
-# --- 功能性指令注册 ---
-jm_matcher = on_command("jm", aliases={"/jm"}, priority=5, block=False)
+
+# --- 指令注册 ---
+# 保留那些前缀清晰、不会与@消息混淆的指令
+jm_matcher = on_command("jm", aliases={"/jm"}, priority=5, block=True)
 @jm_matcher.handle()
 async def _(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg()):
     album_id = args.extract_plain_text().strip()
     if not album_id.isdigit():
         await matcher.finish("ID格式错误，请输入纯数字的ID。")
     try:
-        await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164') # 睡眠表情
+        await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
     except: pass
     result = await handlers.run_jm_download_task(bot, event, album_id)
     if result == "not_found":
         await matcher.send(f"喵~ 找不到ID为 {album_id} 的本子。")
         try:
             await bot.call_api("unset_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
-            await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060') # 叉号
+            await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060')
         except: pass
 
-random_jm_matcher = on_command("随机jm", aliases={"随机JM"}, priority=5, block=False)
+random_jm_matcher = on_command("随机jm", aliases={"随机JM"}, priority=5, block=True)
 @random_jm_matcher.handle()
 async def _(bot: Bot, event: Event, matcher: Matcher):
     await handlers.handle_random_jm(bot, event, matcher)
 
-challenge_matcher = on_command("#", priority=5, block=False)
-@challenge_matcher.handle()
-async def _(bot: Bot, matcher: Matcher, event: Event):
-    await handlers.handle_challenge_chat(bot, matcher, event)
 
-
-# --- 核心处理器：智能分发所有@消息 ---
-at_me_handler = on_message(rule=to_me(), priority=10, block=False)
+# --- 核心处理器：“总指挥官”模式 ---
+# 这个处理器将接管所有@机器人的消息，并进行智能分发
+at_me_handler = on_message(rule=to_me(), priority=10, block=True)
 @at_me_handler.handle()
 async def _(bot: Bot, matcher: Matcher, event: Event):
-    # 优先处理复杂消息类型，如转发和回复，避免它们被当作普通聊天处理
+    # 1. 优先处理非纯文本的复杂情况（转发和回复）
     forward_id = next((seg.data["id"] for seg in event.message if seg.type == "forward"), None)
     if forward_id:
         await handle_forwarded_message(bot, matcher, event, forward_id)
@@ -80,12 +78,18 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
         await handle_reply_message(bot, matcher, event)
         return
     
-    # 将剩余的纯文本@消息视为指令或聊天
+    # 2. 将剩余的纯文本@消息视为指令或聊天
     text = event.get_plaintext().strip()
+    if text.startswith("#"):
+        logger.debug(f"在@消息中检测到猜病指令，手动分发...")
+        # 直接调用猜病的处理函数
+        await handlers.handle_challenge_chat(bot, matcher, event)
+        # 别忘了用 finish() 结束，防止它被当作普通聊天
+        await matcher.finish()
     cmd_parts = text.split()
     cmd = cmd_parts[0].lower() if cmd_parts else ""
     
-    # 指令分发系统：检查是否是特定指令
+    # 3. 指令分发系统：检查是否是特定指令
     if cmd == "help":
         await matcher.finish(utils.get_help_menu())
         return
@@ -97,11 +101,13 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
 
     # 兼容 //memory, /memory, 和 memory
     if cmd.lstrip('/') == "memory":
+        # 提取 memory 指令后的参数
         args_text = text.split(maxsplit=1)[1] if len(cmd_parts) > 1 else ""
-        await handlers.handle_memory_command(matcher, event, args=Message(args_text))
+        args_msg = Message(args_text)
+        await handlers.handle_memory_command(matcher, event, args=args_msg)
         return
 
-    # 如果不是任何已知指令，则进入通用聊天处理器
+    # 4. 如果不是任何已知指令，则进入通用聊天处理器
     await handle_direct_at_message(bot, matcher, event)
 
 
@@ -245,3 +251,12 @@ async def handle_direct_at_message(bot: Bot, matcher: Matcher, event: Event):
     if not full_text: 
         await matcher.finish("喵呜？主人有什么事吗？")
     await handlers.handle_chat_session(bot, matcher, event, {"role": "user", "content": full_text})
+
+
+# 【重要】主动聊天处理器也使用你原始版本，因为它只是一个触发器
+active_chat_handler = on_message(priority=99, block=False)
+@active_chat_handler.handle()
+async def _(bot: Bot, event: Event):
+    if isinstance(event, GroupMessageEvent): 
+        # 它只负责把事件交给 handlers.py 里的新逻辑去处理
+        await handlers.handle_active_chat_check(bot, event)

@@ -305,147 +305,6 @@ async def handle_clear_command(matcher: Matcher, event: Event):
     await matcher.send(result_message)
     data_store.save_memory_to_file()
 
-group_message_recorder = on_message(priority=5, block=False)
-
-@group_message_recorder.handle()
-async def _(bot: Bot, event: GroupMessageEvent):
-    """这个处理器像一个忠实的书记官，记录所有群聊消息到历史记录中。"""
-    group_id = str(event.group_id)
-    user_id = str(event.user_id)
-    history = data_store.get_group_history(group_id)
-    
-    # 获取发言者昵称
-    try:
-        member_info = await bot.get_group_member_info(group_id=event.group_id, user_id=int(user_id))
-        user_name = member_info.get('card') or member_info.get('nickname') or user_id
-    except Exception:
-        user_name = event.sender.nickname or user_id
-        
-    new_message_text = event.get_plaintext().strip()
-    # 如果是空消息（比如只发了张图片），我们依然记录一个占位符，保持上下文完整
-    if not new_message_text:
-        # 我们可以用 describe_message_content_async 来获取更丰富的描述
-        new_message_text = await _describe_message_content_for_active_chat(bot, event.message)
-    
-    # 构造并存入结构化的历史记录
-    structured_message = {
-        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "user_id": user_id,
-        "user_name": user_name,
-        "content": new_message_text,
-        "is_bot": user_id == bot.self_id # 标记是否是机器人自己
-    }
-    history.append(structured_message)
-    logger.debug(f"[记录员] 已记录群({group_id})消息: {user_name}: {new_message_text[:30]}...")
-    
-    # 摘要更新逻辑保持不变
-    if user_id != bot.self_id and data_store.increment_and_check_summary_trigger(group_id):
-        asyncio.create_task(update_summary_for_group(group_id, list(history)))
-
-async def _describe_message_content_for_active_chat(bot: Bot, message: Message) -> str:
-    # 这个函数可以根据你的需求扩展，目前先做简单处理
-    if not message: return "[一条空消息]"
-    for seg in message:
-        if seg.type == 'image': return "[图片]"
-        if seg.type == 'face': return "[表情]"
-        if seg.type == 'record': return "[语音]"
-        if seg.type == 'json': return "[小程序/卡片]"
-    return "[一条非纯文本消息]"
-
-active_chat_decider = on_message(priority=99, block=False)
-
-@active_chat_decider.handle()
-async def _(bot: Bot, event: GroupMessageEvent):
-    """这个处理器只在所有其他处理器都运行完毕后，才根据完整的历史记录进行决策。"""
-    # 排除指令、@消息和机器人自己的消息，避免对自己或指令做出反应
-    if event.is_tome() or event.get_message().extract_plain_text().startswith(("/", "#")):
-        return
-    if not config.ACTIVE_CHAT_ENABLED or str(event.group_id) not in config.ACTIVE_CHAT_WHITELIST:
-        return
-    if event.get_user_id() == bot.self_id:
-        return
-    if not data_store.check_and_set_cooldown(str(event.group_id)):
-        return
-
-    # 从 data_store 获取包含所有记录的完整历史
-    group_id = str(event.group_id)
-    history = data_store.get_group_history(group_id)
-    if not history: return
-
-    group_summary = data_store.get_group_summary(group_id)
-
-    def format_history_for_prompt(hist_list):
-        """
-        能够兼容旧的字符串格式历史，避免因数据格式混杂而崩溃。
-        """
-        formatted = []
-        for msg in hist_list:
-            # 关键的兼容性检查
-            if isinstance(msg, dict):
-                # 如果是新的字典格式，就正常处理
-                formatted.append(f"[{msg['timestamp']}] [用户ID:{msg['user_id']} (昵称:{msg['user_name']})]: {msg['content']}")
-            elif isinstance(msg, str):
-                # 如果是旧的字符串格式，就直接使用它
-                formatted.append(msg)
-        return formatted
-
-    # 我们把整个历史记录都传给格式化函数
-    history_for_prompt = format_history_for_prompt(list(history))
-    
-    # API的输入格式需要区分 "recent_history" 和 "new_message"
-    # 所以我们把最后一个消息作为 new_message
-    recent_history_prompt = history_for_prompt[:-1]
-    new_message_prompt = history_for_prompt[-1]
-
-    decision_payload = {
-        "group_summary": group_summary,
-        "recent_history": recent_history_prompt,
-        "new_message": new_message_prompt
-    }
-    
-    decision_messages = [{"role": "user", "content": json.dumps(decision_payload, ensure_ascii=False)}]
-    system_prompt_with_time = config.ACTIVE_CHAT_DECISION_PROMPT.format(current_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    
-    try:
-        logger.info(f"[主动聊天] 群({group_id}) 正在进行决策...")
-        api_response = await llm_client.call_gemini_api(
-            messages=decision_messages,
-            system_prompt_content=system_prompt_with_time,
-            model_to_use=config.ACTIVE_CHAT_DECISION_MODEL,
-            use_tools=False
-        )
-        if "error" in api_response:
-            logger.error(f"[主动聊天] 决策API调用失败: {api_response['error']}")
-            return
-
-        response_content = api_response["choices"][0]["message"].get("content", "")
-        if response_content.startswith("```json"):
-            response_content = response_content.strip("```json").strip("```").strip()
-        
-        decision_data = json.loads(response_content)
-        
-        if decision_data.get("should_reply") is True:
-            reply_text = decision_data.get("reply_content", "").strip()
-            if reply_text:
-                logger.info(f"[主动聊天] 决定回复群({group_id})，内容: {reply_text}")
-                sent_message = await bot.send(event, message=reply_text)
-                
-                # 【回写】把机器人自己的发言也记录到历史中
-                bot_name = (await bot.get_login_info())['nickname'] or "一猫"
-                structured_message = {
-                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "user_id": bot.self_id,
-                    "user_name": bot_name,
-                    "content": reply_text,
-                    "is_bot": True
-                }
-                history.append(structured_message)
-                logger.debug(f"[回写] 已记录主动聊天回复到群({group_id})历史。")
-
-    except json.JSONDecodeError:
-        logger.warning(f"[主动聊天] 解析决策JSON失败: {response_content}")
-    except Exception as e:
-        logger.error(f"[主动聊天] 处理过程中发生未知错误: {e}", exc_info=True)
 
 
 
@@ -622,3 +481,126 @@ async def handle_bili_card(bot: Bot, event: GroupMessageEvent, matcher: Matcher)
 
             except Exception as e:
                 logger.error(f"解析B站小程序时出错: {e}", exc_info=True)
+
+group_message_recorder = on_message(priority=1, block=False)
+
+@group_message_recorder.handle()
+async def _(bot: Bot, event: GroupMessageEvent):
+    """
+    这个处理器拥有最高优先级，像一个忠实的书记官，
+    在任何功能被触发之前，就将所有群聊消息记录到历史中。
+    """
+    group_id = str(event.group_id)
+    user_id = str(event.user_id)
+    history = data_store.get_group_history(group_id)
+    
+    try:
+        member_info = await bot.get_group_member_info(group_id=event.group_id, user_id=int(user_id))
+        user_name = member_info.get('card') or member_info.get('nickname') or user_id
+    except Exception:
+        user_name = event.sender.nickname or user_id
+        
+    message_text = event.get_plaintext().strip()
+    if not message_text:
+        message_text = await _describe_message_content_for_active_chat(bot, event.message)
+    
+    structured_message = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user_id": user_id,
+        "user_name": user_name,
+        "content": message_text,
+        "is_bot": user_id == bot.self_id
+    }
+    history.append(structured_message)
+    logger.debug(f"[记录员 V_Final] 已记录群({group_id})消息: {user_name}: {message_text[:30]}...")
+    
+    if user_id != bot.self_id and data_store.increment_and_check_summary_trigger(group_id):
+        asyncio.create_task(update_summary_for_group(group_id, list(history)))
+
+async def _describe_message_content_for_active_chat(bot: Bot, message: Message) -> str:
+    """为主动聊天历史记录，简单描述非纯文本消息。"""
+    if not message: return "[一条空消息]"
+    for seg in message:
+        if seg.type == 'image': return "[图片]"
+        if seg.type == 'face': return "[表情]"
+        if seg.type == 'record': return "[语音]"
+        if seg.type == 'json': return "[小程序/卡片]"
+    return "[一条非纯文本消息]"
+
+# 2. 主动聊天决策者 (注意：这个就是你 `__init__.py` 文件末尾的 `active_chat_handler` 所调用的函数)
+# 我们把它放在这里，但让 `__init__.py` 来调用
+async def handle_active_chat_check(bot: Bot, event: GroupMessageEvent):
+    """这个处理器只在所有其他处理器都运行完毕后，才根据完整的历史记录进行决策。"""
+    if not config.ACTIVE_CHAT_ENABLED or str(event.group_id) not in config.ACTIVE_CHAT_WHITELIST:
+        return
+    if not data_store.check_and_set_cooldown(str(event.group_id)):
+        return
+
+    group_id = str(event.group_id)
+    history = data_store.get_group_history(group_id)
+    if not history: return
+
+    group_summary = data_store.get_group_summary(group_id)
+
+    def format_history_for_prompt(hist_list):
+        formatted = []
+        for msg in hist_list:
+            if isinstance(msg, dict):
+                formatted.append(f"[{msg['timestamp']}] [用户ID:{msg['user_id']} (昵称:{msg['user_name']})]: {msg['content']}")
+            elif isinstance(msg, str):
+                formatted.append(msg)
+        return formatted
+
+    history_for_prompt = format_history_for_prompt(list(history))
+    if not history_for_prompt: return
+    
+    recent_history_prompt = history_for_prompt[:-1]
+    new_message_prompt = history_for_prompt[-1]
+
+    decision_payload = {
+        "group_summary": group_summary,
+        "recent_history": recent_history_prompt,
+        "new_message": new_message_prompt
+    }
+    
+    decision_messages = [{"role": "user", "content": json.dumps(decision_payload, ensure_ascii=False)}]
+    system_prompt_with_time = config.ACTIVE_CHAT_DECISION_PROMPT.format(current_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    
+    try:
+        logger.info(f"[主动聊天] 群({group_id}) 正在进行决策...")
+        api_response = await llm_client.call_gemini_api(
+            messages=decision_messages,
+            system_prompt_content=system_prompt_with_time,
+            model_to_use=config.ACTIVE_CHAT_DECISION_MODEL,
+            use_tools=False
+        )
+        if "error" in api_response:
+            logger.error(f"[主动聊天] 决策API调用失败: {api_response['error']}")
+            return
+
+        response_content = api_response["choices"][0]["message"].get("content", "")
+        if response_content.startswith("```json"):
+            response_content = response_content.strip("```json").strip("```").strip()
+        
+        decision_data = json.loads(response_content)
+        
+        if decision_data.get("should_reply") is True:
+            reply_text = decision_data.get("reply_content", "").strip()
+            if reply_text:
+                logger.info(f"[主动聊天] 决定回复群({group_id})，内容: {reply_text}")
+                await bot.send(event, message=reply_text)
+                
+                bot_name = (await bot.get_login_info())['nickname'] or "一猫"
+                structured_message = {
+                    "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "user_id": bot.self_id,
+                    "user_name": bot_name,
+                    "content": reply_text,
+                    "is_bot": True
+                }
+                history.append(structured_message)
+                logger.debug(f"[回写] 已记录主动聊天回复到群({group_id})历史。")
+    except json.JSONDecodeError:
+        logger.warning(f"[主动聊天] 解析决策JSON失败: {response_content}")
+    except Exception as e:
+        logger.error(f"[主动聊天] 处理过程中发生未知错误: {e}", exc_info=True)
