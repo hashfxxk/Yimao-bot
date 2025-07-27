@@ -344,7 +344,7 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
         if response_content:
              history.append({"role": "assistant", "content": response_content})
              await matcher.send(Message(response_content))
-             if "不是神经的问题吗" in response_content or "我自己的问题" in response_content:
+             if "Success" in response_content or "Fail" in response_content:
                 data_store.clear_challenge_history(session_id)
                 await matcher.send("（游戏已结束，可使用 `#新游戏` 重新开始）")
         else:
