@@ -24,9 +24,6 @@
 
 ## 🛠️ 完整技术栈 (The Full Stack)
 
-本项目的运行依赖于以下几个核心组件的精妙配合：
-
-`QQ <--> LLOneBot <--> NoneBot2 <--> new-api <--> Google Gemini`
 
 *   **QQ 客户端 (QQ Client):** [**LLOneBot**](https://github.com/LLOneBot/LLOneBot)
     *   负责连接 QQ 平台，将真实的 QQ 消息转换为 OneBot V11 标准事件，并反向将机器人的回复发送回 QQ。是机器人与外界沟通的桥梁。
@@ -39,8 +36,6 @@
 
 *   **核心大语言模型 (Core LLM):** **Google Gemini**
     *   所有 AI 对话、内容生成和决策的最终驱动力，由 `new-api` 网关进行代理和适配。
-
-这个组合拳让机器人既能稳定地在 QQ 上运行，又能灵活地使用强大的 Gemini 模型。
 
 ---
 
