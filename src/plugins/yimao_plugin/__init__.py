@@ -39,7 +39,7 @@ async def on_shutdown():
     logger.info("用户记忆和群组摘要已保存。")
 
 # --- 功能性指令注册 ---
-jm_matcher = on_command("jm", aliases={"/jm"}, priority=5, block=True)
+jm_matcher = on_command("jm", aliases={"/jm"}, priority=5, block=False)
 @jm_matcher.handle()
 async def _(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg()):
     album_id = args.extract_plain_text().strip()
@@ -56,19 +56,19 @@ async def _(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg
             await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060') # 叉号
         except: pass
 
-random_jm_matcher = on_command("随机jm", aliases={"随机JM"}, priority=5, block=True)
+random_jm_matcher = on_command("随机jm", aliases={"随机JM"}, priority=5, block=False)
 @random_jm_matcher.handle()
 async def _(bot: Bot, event: Event, matcher: Matcher):
     await handlers.handle_random_jm(bot, event, matcher)
 
-challenge_matcher = on_command("#", priority=5, block=True)
+challenge_matcher = on_command("#", priority=5, block=False)
 @challenge_matcher.handle()
 async def _(bot: Bot, matcher: Matcher, event: Event):
     await handlers.handle_challenge_chat(bot, matcher, event)
 
 
 # --- 核心处理器：智能分发所有@消息 ---
-at_me_handler = on_message(rule=to_me(), priority=10, block=True)
+at_me_handler = on_message(rule=to_me(), priority=10, block=False)
 @at_me_handler.handle()
 async def _(bot: Bot, matcher: Matcher, event: Event):
     # 优先处理复杂消息类型，如转发和回复，避免它们被当作普通聊天处理
@@ -245,11 +245,3 @@ async def handle_direct_at_message(bot: Bot, matcher: Matcher, event: Event):
     if not full_text: 
         await matcher.finish("喵呜？主人有什么事吗？")
     await handlers.handle_chat_session(bot, matcher, event, {"role": "user", "content": full_text})
-
-# --- 主动聊天处理器 (低优先级，不阻塞其他响应) ---
-active_chat_handler = on_message(priority=99, block=False)
-@active_chat_handler.handle()
-async def _(bot: Bot, event: Event):
-    # 仅在群聊中触发主动聊天逻辑
-    if isinstance(event, GroupMessageEvent): 
-        await handlers.handle_active_chat_check(bot, event)

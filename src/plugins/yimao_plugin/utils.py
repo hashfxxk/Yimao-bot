@@ -1,5 +1,6 @@
 # yimao_plugin/utils.py
 import logging
+import datetime
 from . import config, data_store
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 
@@ -52,13 +53,22 @@ async def send_long_message_as_forward(bot: Bot, event: Event, content: str, bot
         sent_receipt = None
         if isinstance(event, GroupMessageEvent):
             sent_receipt = await bot.send_group_forward_msg(group_id=event.group_id, messages=forward_nodes)
+            
+            # 【核心修改】在这里把机器人的发言写回历史记录
+            history = data_store.get_group_history(str(event.group_id))
+            structured_message = {
+                "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "user_id": bot.self_id,
+                "user_name": bot_name,
+                "content": content, # 记录完整的原始内容
+                "is_bot": True
+            }
+            history.append(structured_message)
+            logger.debug(f"[回写] 已记录机器人长消息到群({event.group_id})历史。")
+
         else:
+            # 私聊部分暂时不处理主动聊天，所以可以不写回
             sent_receipt = await bot.send_private_forward_msg(user_id=event.user_id, messages=forward_nodes)
-
-        if sent_receipt and 'message_id' in sent_receipt:
-            data_store.cache_forward_content(int(sent_receipt['message_id']), content)
-
-        return sent_receipt
         
     except Exception as e:
         logger.error(f"发送合并转发消息失败: {e}", exc_info=True)
