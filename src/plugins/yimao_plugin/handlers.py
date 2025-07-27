@@ -128,25 +128,20 @@ async def handle_random_jm(bot: Bot, event: Event, matcher: Matcher):
         await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060')
     except: pass
 
-# yimao_plugin/handlers.py
-# ... (文件的其他部分保持不变) ...
-
 async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_message_payload: dict):
     session_id = event.get_session_id()
     if isinstance(event, GroupMessageEvent):
         try:
-            # 尝试给收到的消息点个表情，表示“正在思考”
             await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
         except: pass
     
+    # 【最终修正】不再有摘要，content就是一切
     content = user_message_payload["content"]
 
-    # 从消息内容中提取纯文本，用于判断模式和生成摘要
     prompt_text = ""
     if isinstance(content, str):
         prompt_text = content
     elif isinstance(content, list):
-        # 对于多模态消息，只提取其中的文本部分作为代表
         for item in content:
             if item.get('type') == 'text':
                 prompt_text = item['text']
@@ -155,114 +150,88 @@ async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_mes
     is_slash_mode = prompt_text.lstrip().startswith('/')
     mode = "slash" if is_slash_mode else "normal"
 
-    # 如果是新会话，用第一句话作为记忆插槽的摘要
     data_store.update_slot_summary_if_needed(session_id, mode, prompt_text)
     
-    # 获取当前激活的对话历史队列
     history = data_store.get_active_history(session_id, mode)
     
-    # 【安全加固】将用户的输入结构化地存入历史记录
-    history_record_for_user = {
-        "role": "user",
-        "content": content, # 直接存入原始的 content (str 或 list)
-        "message_id": event.message_id,
-        "sender_id": event.get_user_id(),
-        "sender_name": event.sender.card or event.sender.nickname
-    }
+    now_ts_str = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
+    
+    # 【最终修正】构造忠实、完整的历史记录
+    history_record_for_user = {"role": "user", "message_id": event.message_id}
+    
+    if isinstance(content, str):
+         history_record_for_user['content'] = content if is_slash_mode else now_ts_str + content
+    else: # is list
+        history_content_copy = [dict(item) for item in content]
+        for item in history_content_copy:
+            if item.get('type') == 'text':
+                item['text'] = item['text'] if is_slash_mode else now_ts_str + item['text']
+                break
+        history_record_for_user['content'] = history_content_copy
+        
     history.append(history_record_for_user)
     
-    # 【改造】准备发送给API的消息列表
-    # API不需要我们自己加的时间戳，所以我们从历史记录中提取纯净的 content
-    messages_for_api = [{"role": msg["role"], "content": msg["content"]} for msg in history]
+    messages_for_api = list(history)
 
-    # 根据不同模式，选择模型、Prompt和是否使用工具
     if mode == "slash":
-        model, system_prompt, use_tools = config.SLASH_COMMAND_MODEL_NAME, config.SLASH_COMMAND_SYSTEM_PROMPT, False
-        # Loki模式的特殊处理：在第一轮对话时，将System Prompt注入到User Prompt中
-        if len(messages_for_api) == 1:
-            first_turn_content = messages_for_api[0]['content']
-            if isinstance(first_turn_content, str):
-                messages_for_api[0]['content'] = f"{system_prompt}\n\n---\n\n{first_turn_content.lstrip('/')}"
-            elif isinstance(first_turn_content, list):
-                 for item in first_turn_content:
+        model, system_prompt, use_function_calling = config.SLASH_COMMAND_MODEL_NAME, "", False
+        if len(history) == 1:
+            first_turn_payload = messages_for_api[0]
+            original_content = ""
+            if isinstance(first_turn_payload.get('content'), str):
+                original_content = first_turn_payload['content'].lstrip(now_ts_str)
+                first_turn_payload['content'] = f"{config.SLASH_COMMAND_SYSTEM_PROMPT}\n\n---\n\n{original_content.lstrip('/')}"
+            elif isinstance(first_turn_payload.get('content'), list):
+                 for item in first_turn_payload['content']:
                      if item.get('type') == 'text':
-                         item['text'] = f"{system_prompt}\n\n---\n\n{item['text'].lstrip('/')}"
+                         original_content = item['text'].lstrip(now_ts_str)
+                         item['text'] = f"{config.SLASH_COMMAND_SYSTEM_PROMPT}\n\n---\n\n{original_content.lstrip('/')}"
                          break
-            system_prompt = "" # 清空，避免重复添加
     else: 
-        model, system_prompt, use_tools = config.DEFAULT_MODEL_NAME, config.DEFAULT_SYSTEM_PROMPT_TEMPLATE, True
+        model, system_prompt, use_function_calling = config.DEFAULT_MODEL_NAME, config.DEFAULT_SYSTEM_PROMPT_TEMPLATE, True
         
     logger.info(f"会话 {session_id} (模式: {mode}) 收到请求。")
     try:
-        # 工具调用循环，最多进行5轮，防止死循环
         max_turns = 5
         for _ in range(max_turns):
-            api_response = await llm_client.call_gemini_api(messages_for_api, system_prompt, model, use_tools)
-            
+            api_response = await llm_client.call_gemini_api(messages_for_api, system_prompt, model, use_function_calling)
             if "error" in api_response:
                 error_msg_from_api = api_response["error"].get("message", "发生未知错误")
                 await matcher.send(f"喵呜~ API出错了: {error_msg_from_api}")
-                if history: history.pop() # 如果出错，撤销本次用户输入
+                if history: history.pop()
                 break
             
             response_message = api_response["choices"][0]["message"]
             
-            # 如果AI请求调用工具
             if response_message.get("tool_calls"):
                 logger.info("模型请求调用工具...")
-                # 将AI的思考和工具调用请求存入历史
-                messages_for_api.append(response_message)
-                history.append(response_message)
+                assistant_message = {"role": "assistant", "tool_calls": response_message["tool_calls"]}
+                if response_message.get("content"):
+                    assistant_message["content"] = response_message["content"]
+                
+                messages_for_api.append(assistant_message)
+                history.append(assistant_message) 
 
                 for tool_call in response_message["tool_calls"]:
                     function_name = tool_call["function"]["name"]
                     function_args = json.loads(tool_call["function"].get("arguments", "{}"))
-                    
                     if function_name in tools.available_tools:
                         function_to_call = tools.available_tools[function_name]
-                        tool_output = await function_to_call(**function_args)
-                        
-                        # 将工具的执行结果也存入历史，供AI下一步参考
+                        tool_output = await function_to_call(**function_args) if asyncio.iscoroutinefunction(function_to_call) else function_to_call(**function_args)
                         tool_response = {"tool_call_id": tool_call["id"], "role": "tool", "name": function_name, "content": tool_output}
                         messages_for_api.append(tool_response)
                         history.append(tool_response)
                     else:
-                        # 处理未知的工具调用
                         tool_error_response = {"tool_call_id": tool_call["id"], "role": "tool", "name": function_name, "content": f"错误: 函数 '{function_name}' 未定义。"}
                         messages_for_api.append(tool_error_response)
                         history.append(tool_error_response)
-                
-                # 继续循环，带着工具调用的结果再次请求API
                 continue
-            
-            # 如果AI直接回复内容
             else:
-                response_content = response_message.get("content", "").strip()
-                assistant_message_payload = {"role": "assistant", "content": response_content}
-                
-                if not response_content:
-                    logger.warning(f"从API收到了空的响应内容: {api_response}")
-                    await matcher.send("喵~ 我好像没什么好说的...")
-                # 根据内容长度决定发送方式
-                elif len(response_content) > config.FORWARD_TRIGGER_THRESHOLD:
-                    bot_name = "Loki" if mode == "slash" else "一猫"
-                    sent_msg_receipt = await utils.send_long_message_as_forward(bot, event, response_content, bot_name)
-                else:
-
-                    sent_msg_receipt = await matcher.send(Message(response_content))
-
-                # 将发送回执中的 message_id 记录下来
-                if sent_msg_receipt and 'message_id' in sent_msg_receipt:
-                    assistant_message_payload['message_id'] = int(sent_msg_receipt['message_id'])
-                    assistant_message_payload['response_to_id'] = event.message_id
-                
-                # 【回写-1】将AI的回复存入会话记忆
-                history.append(assistant_message_payload)
-                
-                # 【回写-2】如果是在群聊中，也将AI的回复写入主动聊天的历史记录
+                response_content = response_message.get("content", "")
                 if isinstance(event, GroupMessageEvent) and response_content:
                     history_for_active_chat = data_store.get_group_history(str(event.group_id))
                     bot_name = "Loki" if mode == "slash" else (await bot.get_login_info())['nickname'] or "一猫"
+                    # 这里我们只记录干净的、最终的回复内容
                     structured_message = {
                         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "user_id": bot.self_id,
@@ -272,26 +241,39 @@ async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_mes
                     }
                     history_for_active_chat.append(structured_message)
                     logger.debug(f"[回写] 已记录机器人聊天回复到群({event.group_id})历史。")
+                assistant_timestamped_content = response_content if is_slash_mode else datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ") + response_content
+                assistant_message_payload = {"role": "assistant", "content": assistant_timestamped_content}
+                sent_msg_receipt = None
 
-                # 结束工具调用循环
+                if len(response_content) > config.FORWARD_TRIGGER_THRESHOLD:
+                    bot_name = "Loki" if mode == "slash" else "一猫"
+                    sent_msg_receipt = await utils.send_long_message_as_forward(bot, event, response_content, bot_name)
+                elif response_content:
+                    sent_msg_receipt = await matcher.send(Message(response_content))
+                else:
+                    logger.warning(f"从API收到了空的响应内容: {api_response}")
+                    await matcher.send("喵~ 我好像没什么好说的...")
+
+                if sent_msg_receipt and 'message_id' in sent_msg_receipt:
+                    assistant_message_payload['message_id'] = int(sent_msg_receipt['message_id'])
+                    assistant_message_payload['response_to_id'] = event.message_id
+                
+                history.append(assistant_message_payload)
                 break
         else:
-            # 如果循环超过最大次数，给出提示
-            await matcher.send("喵呜~ 我思考得太久了，好像陷入了无限循环...")
+            await matcher.send("喵呜~ 我思考得太久了...")
         
-        # 保存本次会话的全部记忆
-        data_store.save_memory_to_file()
+        if "error" not in locals().get("api_response", {}):
+            data_store.save_memory_to_file()
 
         if isinstance(event, GroupMessageEvent):
             try:
-                # 尝试更新emoji，表示处理完成
                 await bot.call_api("unset_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
                 await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10024')
             except: pass
             
     except Exception as e:
-        # 如果处理过程中发生任何错误，都尝试撤销本次用户的输入，防止污染历史记录
-        if history and history[-1]["role"] == "user":
+        if history and history[-1] is history_record_for_user:
             history.pop()
         logger.error(f"处理聊天时出错: {e}", exc_info=True)
         await matcher.send("喵呜~ 我的大脑好像被毛线缠住啦！请检查后台日志。")
