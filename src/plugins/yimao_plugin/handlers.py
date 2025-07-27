@@ -307,26 +307,56 @@ async def handle_active_chat_check_logic(bot: Bot, event: GroupMessageEvent):
     group_id = str(event.group_id)
     user_id = str(event.user_id)
     history = data_store.get_group_history(group_id)
+    
     try:
         member_info = await bot.get_group_member_info(group_id=event.group_id, user_id=int(user_id))
         user_name = member_info.get('card') or member_info.get('nickname') or user_id
     except Exception:
         user_name = event.sender.nickname or user_id
+        
     new_message_text = event.get_plaintext().strip()
     if not new_message_text:
         return
-    now_ts_str = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
-    formatted_new_message = f"{now_ts_str}{user_name}: {new_message_text}"
-    history.append(formatted_new_message)
+        
+    # --- 【核心安全升级】采用结构化的上下文格式 ---
+    # 我们不再把用户名和消息拼成一个简单的字符串，而是用一个字典来表示。
+    # 这样AI就能明确知道说话人的ID和昵称，不会被带逗号的昵称欺骗。
+    now_ts_str = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    structured_message = {
+        "timestamp": now_ts_str.strip(), # 移除方括号和空格
+        "user_id": user_id,
+        "user_name": user_name,
+        "content": new_message_text
+    }
+    # history 里现在存放的是字典，而不是字符串
+    history.append(structured_message)
+    
     if data_store.increment_and_check_summary_trigger(group_id):
+        # 摘要更新逻辑也需要能处理新的结构化历史
         asyncio.create_task(update_summary_for_group(group_id, list(history)))
+        
     if not data_store.check_and_set_cooldown(group_id):
         return
+        
     group_summary = data_store.get_group_summary(group_id) 
+    
+    # 将结构化的历史记录转换成对AI友好的字符串格式，但用ID来标识用户
+    # 这是一个关键的保护措施
+    def format_history_for_prompt(hist_list):
+        formatted = []
+        for msg in hist_list:
+            # 在Prompt里，我们用 user_id 来称呼用户，避免昵称注入
+            # 但把昵称作为补充信息放在括号里，让AI知道TA叫什么
+            formatted.append(f"{msg['timestamp']} [用户ID:{msg['user_id']} (昵称:{msg['user_name']})]: {msg['content']}")
+        return formatted
+
+    history_for_prompt = format_history_for_prompt(list(history)[:-1])
+    new_message_for_prompt = format_history_for_prompt([structured_message])[0]
+
     decision_payload = {
         "group_summary": group_summary,
-        "recent_history": list(history)[:-1],
-        "new_message": formatted_new_message
+        "recent_history": history_for_prompt, # 使用格式化后的安全历史
+        "new_message": new_message_for_prompt  # 使用格式化后的安全新消息
     }
     decision_messages = [{"role": "user", "content": json.dumps(decision_payload, ensure_ascii=False)}]
     system_prompt_with_time = config.ACTIVE_CHAT_DECISION_PROMPT.format(current_time=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -410,16 +440,29 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
 async def update_summary_for_group(group_id: str, history_list: list):
     logger.info(f"正在为群组 {group_id} 生成摘要...")
     old_summary = data_store.get_group_summary(group_id)
+    
+    # 将结构化的历史记录转换成对AI友好的字符串格式
+    def format_history_for_summary(hist_list):
+        formatted = []
+        for msg in hist_list:
+            if isinstance(msg, dict): # 兼容新格式
+                formatted.append(f"{msg['timestamp']} [用户ID:{msg['user_id']} (昵称:{msg['user_name']})]: {msg['content']}")
+            else: # 兼容可能存在的旧格式字符串
+                formatted.append(str(msg))
+        return "\n".join(formatted)
+
+    history_str = format_history_for_summary(history_list)
+    
     summary_prompt = f"""
     你是一个社群观察家，你的任务是阅读一段群聊记录和旧的群聊摘要，然后生成一个新的、更完善的摘要。
     【旧摘要】
     {old_summary}
     【近期聊天记录】
-    { "\\n".join(history_list) }
+    {history_str}
     【你的任务】
     请根据以上信息，提炼并更新群聊摘要。摘要应包含：
     1.  群聊的核心主题或氛围。
-    2.  识别出几位最活跃的群友及其典型特征。
+    2.  识别出几位最活跃的群友及其典型特征（请使用他们的昵称，但要基于用户ID来区分不同的人）。
     3.  记录一些群内最近发生的、可能会在未来被再次提到的大事或流行的梗。
     请以简洁、客观的语言输出新的摘要。
     """
