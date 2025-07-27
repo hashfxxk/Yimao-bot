@@ -1,6 +1,6 @@
 # yimao_plugin/utils.py
 import logging
-from . import config, data_store # 导入 data_store
+from . import config, data_store
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent
 
 logger = logging.getLogger("GeminiPlugin.utils")
@@ -55,7 +55,6 @@ async def send_long_message_as_forward(bot: Bot, event: Event, content: str, bot
         else:
             sent_receipt = await bot.send_private_forward_msg(user_id=event.user_id, messages=forward_nodes)
 
-        # 【核心修正】如果发送成功并拿到了消息ID，立刻缓存原始内容
         if sent_receipt and 'message_id' in sent_receipt:
             data_store.cache_forward_content(int(sent_receipt['message_id']), content)
 

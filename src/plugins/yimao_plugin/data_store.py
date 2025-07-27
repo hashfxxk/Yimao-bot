@@ -5,7 +5,6 @@ import os
 from collections import deque
 from pathlib import Path
 import time
-import asyncio
 from typing import Dict, List, Deque, Optional
 
 from pydantic import BaseModel, Field
@@ -14,8 +13,8 @@ from . import config
 
 logger = logging.getLogger("GeminiPlugin.datastore")
 
-# --- Pydantic Models ---
-
+# --- Pydantic 数据模型定义 ---
+# 使用 Pydantic 来确保数据结构的一致性和可预测性。
 class MemorySlot(BaseModel):
     summary: str = "（空插槽）"
     history: List[Dict] = Field(default_factory=list)
@@ -34,8 +33,8 @@ class UserMemory(BaseModel):
     normal: ConversationMode = Field(default_factory=ConversationMode)
     slash: ConversationMode = Field(default_factory=ConversationMode)
 
-# --- Runtime Data Store ---
-
+# --- 运行时数据存储 ---
+# 这些是程序运行时在内存中的数据，关闭时会持久化。
 _user_memory_data: Dict[str, UserMemory] = {}
 _history_deques: Dict[str, Dict[str, Dict[int, deque]]] = {}
 _challenge_histories: Dict[str, Deque[Dict]] = {}
@@ -43,13 +42,12 @@ _group_summaries: Dict[str, str] = {}
 _group_message_counters: Dict[str, int] = {}
 _group_chat_history: Dict[str, Deque[str]] = {}
 _group_cooldown_timers: Dict[str, float] = {}
-
-# 【新增】用于缓存机器人发送的合并转发内容的运行时字典
+# 缓存机器人自己发送的合并转发内容，避免在处理对自己的回复时无法获取上下文。
 # Key: message_id (int), Value: content (str)
 _forward_content_cache: Dict[int, str] = {}
 
 
-# --- File I/O and State Management ---
+#文件持久化
 
 def _get_memory_path() -> Path:
     return Path(config.MEMORY_FILE_PATH)
@@ -122,12 +120,10 @@ def save_group_summaries_to_file():
     try: path.write_text(json.dumps(_group_summaries, ensure_ascii=False, indent=2), "utf-8")
     except Exception as e: logger.error(f"保存群组摘要至 {path} 时出错: {e}", exc_info=True)
 
-# 【新增】缓存管理函数
+
 def cache_forward_content(message_id: int, content: str):
     """缓存一条由机器人发送的合并转发消息的原始内容。"""
-    # 防止内存无限增长，保留最近500条。这是一个合理的上限。
     if len(_forward_content_cache) > 500:
-        # 移除最早添加的项
         _forward_content_cache.pop(next(iter(_forward_content_cache)))
     _forward_content_cache[message_id] = content
     logger.info(f"已缓存合并转发消息 {message_id} 的内容。")

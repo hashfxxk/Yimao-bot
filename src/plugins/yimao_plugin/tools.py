@@ -16,25 +16,20 @@ async def search_web(query: str) -> str:
     """执行通用的网页搜索。"""
     logger.info(f"正在执行通用网页搜索: {query}")
     try:
-        # 定义一个内部的、同步的搜索函数
         def _sync_search():
-            # 这里是你原始的阻塞代码
             results = DDGS().text(query, max_results=5)
             if not results:
                 return "没有找到相关信息。"
-            # 格式化结果
             formatted_results = "\n".join(
                 [f"- **{r['title']}**: {r['body']}" for r in results]
             )
             return f"这是关于“{query}”的搜索结果：\n{formatted_results}"
 
-        # 使用 asyncio.to_thread 在后台线程中运行同步函数
         result_str = await asyncio.to_thread(_sync_search)
         return result_str
 
     except Exception as e:
         logger.error(f"网页搜索失败: {e}", exc_info=True)
-        # 即使搜索失败，也要返回一个友好的错误信息给LLM，而不是让整个流程崩溃
         return f"工具错误：网页搜索功能在执行查询“{query}”时遇到网络问题或内部错误，无法获取结果。"
 
 async def search_news(query: str) -> str:
@@ -43,7 +38,6 @@ async def search_news(query: str) -> str:
     logger.info(f"新闻搜索请求被触发。忽略原始查询 '{query}'，使用硬编码的有效查询: '{effective_query}'")
     
     try:
-        # 定义一个内部同步函数
         def _sync_search_news():
             with DDGS() as ddgs:
                 results = list(ddgs.text(effective_query, region="cn-zh", max_results=7))
@@ -52,7 +46,6 @@ async def search_news(query: str) -> str:
                     return "抱歉，搜索新闻的功能似乎暂时失效了。"
                 return "\n\n".join([f"标题: {r['title']}\n链接: {r['href']}\n摘要: {r['body']}" for r in results])
 
-        # 在后台线程中运行同步函数
         result_str = await asyncio.to_thread(_sync_search_news)
         return result_str
         

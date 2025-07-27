@@ -132,7 +132,6 @@ async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_mes
             await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
         except: pass
     
-    # 【最终修正】不再有摘要，content就是一切
     content = user_message_payload["content"]
 
     prompt_text = ""
@@ -153,7 +152,6 @@ async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_mes
     
     now_ts_str = datetime.datetime.now().strftime("[%Y-%m-%d %H:%M:%S] ")
     
-    # 【最终修正】构造忠实、完整的历史记录
     history_record_for_user = {"role": "user", "message_id": event.message_id}
     
     if isinstance(content, str):

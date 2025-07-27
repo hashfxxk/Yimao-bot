@@ -3,7 +3,7 @@ import asyncio
 import httpx
 import json
 import logging
-import datetime  # 导入datetime模块
+import datetime
 from . import config, tools
 
 logger = logging.getLogger("GeminiPlugin.client")
@@ -13,28 +13,24 @@ async def call_gemini_api(messages: list, system_prompt_content: str, model_to_u
     api_url = f"{config.DEFAULT_API_BASE_URL}/chat/completions"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {config.DEFAULT_API_TOKEN}"}
 
-    # --- 时间注入逻辑 ---
+    #时间注入逻辑
     formatted_system_prompt = system_prompt_content
-    # 检查传入的提示词是否是我们的模板
     if system_prompt_content and "{current_time}" in system_prompt_content:
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         formatted_system_prompt = system_prompt_content.format(current_time=now_str)
         logger.info(f"已向系统提示词注入当前时间: {now_str}")
-    # --- 注入结束 ---
 
     all_messages = []
     if formatted_system_prompt:
         all_messages.append({"role": "system", "content": formatted_system_prompt})
 
-    # --- 修正后的消息处理逻辑 ---
+    #消息处理逻辑
     if not messages:
-        # 如果传入的 messages 为空，添加占位符
+        # messages 为空
         all_messages.append({"role": "user", "content": "..."})
         logger.info("检测到空消息列表，添加占位符以触发AI开场白。")
     else:
-        # 如果 messages 不为空，则只添加一次
         all_messages.extend(messages)
-    # --- 修正结束 ---
 
     payload = {
         "model": model_to_use,

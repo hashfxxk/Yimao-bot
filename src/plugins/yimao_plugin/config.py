@@ -4,25 +4,19 @@ import sys
 from pathlib import Path
 from dotenv import load_dotenv
 
-# --- 核心设置：加载环境变量 ---
-# 找到项目根目录 (botnew/geminibot)
-# Path(__file__) 是当前文件 config.py 的路径
-# .resolve() 获取绝对路径
-# .parents[3] 向上跳三级目录 (yimao_plugin -> plugins -> src -> geminibot)
+# --- 环境变量加载 ---
+# 向上跳三级目录 (yimao_plugin -> plugins -> src -> geminibot) 以找到项目根目录
 PROJECT_ROOT_DIR = Path(__file__).resolve().parents[3]
 ENV_FILE_PATH = PROJECT_ROOT_DIR / ".env"
 
-# 加载 .env 文件
 if ENV_FILE_PATH.exists():
     load_dotenv(dotenv_path=ENV_FILE_PATH)
     print(f"✅ 成功从 {ENV_FILE_PATH} 加载环境变量。")
 else:
     print(f"⚠️ 警告：在 '{ENV_FILE_PATH}' 未找到 .env 文件。将依赖于系统设置的环境变量。", file=sys.stderr)
 
-
-# --- 辅助函数：安全获取环境变量 ---
 def get_env_variable(var_name: str) -> str:
-    """获取环境变量，如果不存在则打印错误并退出。"""
+    """安全地获取环境变量，如果缺失则报错并退出。"""
     value = os.getenv(var_name)
     if value is None:
         print(f"❌ 错误：环境变量 '{var_name}' 未设置。请在 .env 文件或系统中配置它。", file=sys.stderr)
@@ -30,10 +24,9 @@ def get_env_variable(var_name: str) -> str:
     return value
 
 # --- API & 模型配置 ---
-# 使用了新的辅助函数来安全获取环境变量，并且移除了硬编码的默认值
 DEFAULT_API_BASE_URL = get_env_variable("NEWAPI_URL") + "/v1"
 DEFAULT_API_TOKEN = get_env_variable("NEWAPI_TOKEN")
-
+#由于我的NewAPI问题，这里使用了模型映射。根据自己需要使用模型即可。
 DEFAULT_MODEL_NAME = "gemini-2.0-flash"
 SLASH_COMMAND_MODEL_NAME = "gemini-1.5-pro"
 

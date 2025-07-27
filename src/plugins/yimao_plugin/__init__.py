@@ -19,8 +19,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("GeminiPlugin")
 driver = get_driver()
 
+# --- 生命周期钩子 ---
 @driver.on_startup
 async def on_startup():
+    """在机器人启动时加载持久化数据。"""
     logger.info("正在加载用户记忆...")
     data_store.load_memory_from_file()
     logger.info("正在加载群组长期记忆摘要...")
@@ -29,14 +31,14 @@ async def on_startup():
 
 @driver.on_shutdown
 async def on_shutdown():
+    """在机器人关闭前保存所有运行时数据。"""
     logger.info("正在保存用户记忆...")
     data_store.save_memory_to_file()
     logger.info("正在保存群组长期记忆摘要...")
     data_store.save_group_summaries_to_file()
     logger.info("用户记忆和群组摘要已保存。")
 
-# --- 指令注册 ---
-# 保留那些前缀清晰、不会与@消息混淆的指令
+# --- 功能性指令注册 ---
 jm_matcher = on_command("jm", aliases={"/jm"}, priority=5, block=True)
 @jm_matcher.handle()
 async def _(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg()):
@@ -44,14 +46,14 @@ async def _(bot: Bot, event: Event, matcher: Matcher, args: Message = CommandArg
     if not album_id.isdigit():
         await matcher.finish("ID格式错误，请输入纯数字的ID。")
     try:
-        await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
+        await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164') # 睡眠表情
     except: pass
     result = await handlers.run_jm_download_task(bot, event, album_id)
     if result == "not_found":
         await matcher.send(f"喵~ 找不到ID为 {album_id} 的本子。")
         try:
             await bot.call_api("unset_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
-            await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060')
+            await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060') # 叉号
         except: pass
 
 random_jm_matcher = on_command("随机jm", aliases={"随机JM"}, priority=5, block=True)
@@ -65,12 +67,11 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
     await handlers.handle_challenge_chat(bot, matcher, event)
 
 
-# --- 核心处理器：“总指挥官”模式 ---
-# 这个处理器将接管所有@机器人的消息，并进行智能分发
+# --- 核心处理器：智能分发所有@消息 ---
 at_me_handler = on_message(rule=to_me(), priority=10, block=True)
 @at_me_handler.handle()
 async def _(bot: Bot, matcher: Matcher, event: Event):
-    # 1. 优先处理非纯文本的复杂情况（转发和回复）
+    # 优先处理复杂消息类型，如转发和回复，避免它们被当作普通聊天处理
     forward_id = next((seg.data["id"] for seg in event.message if seg.type == "forward"), None)
     if forward_id:
         await handle_forwarded_message(bot, matcher, event, forward_id)
@@ -79,12 +80,12 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
         await handle_reply_message(bot, matcher, event)
         return
     
-    # 2. 将剩余的纯文本@消息视为指令或聊天
+    # 将剩余的纯文本@消息视为指令或聊天
     text = event.get_plaintext().strip()
     cmd_parts = text.split()
     cmd = cmd_parts[0].lower() if cmd_parts else ""
     
-    # 3. 指令分发系统：检查是否是特定指令
+    # 指令分发系统：检查是否是特定指令
     if cmd == "help":
         await matcher.finish(utils.get_help_menu())
         return
@@ -96,24 +97,24 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
 
     # 兼容 //memory, /memory, 和 memory
     if cmd.lstrip('/') == "memory":
-        # 提取 memory 指令后的参数
         args_text = text.split(maxsplit=1)[1] if len(cmd_parts) > 1 else ""
-        args_msg = Message(args_text)
-        await handlers.handle_memory_command(matcher, event, args=args_msg)
+        await handlers.handle_memory_command(matcher, event, args=Message(args_text))
         return
 
-    # 4. 如果不是任何已知指令，则进入通用聊天处理器
+    # 如果不是任何已知指令，则进入通用聊天处理器
     await handle_direct_at_message(bot, matcher, event)
 
 
-# --- 辅助处理函数 (保持最终形态) ---
+# --- 复杂消息处理辅助函数 ---
 
 def _describe_message_content_sync(raw_message) -> str:
+    """同步地、简单地描述一条消息的内容，用于构建上下文。"""
     if not raw_message: return "[一条空消息]"
     if isinstance(raw_message, str): return raw_message.strip()
     if isinstance(raw_message, list):
         text_parts = [seg['data']['text'] for seg in raw_message if seg.get('type') == 'text' and seg.get('data', {}).get('text', '').strip()]
         if text_parts: return "".join(text_parts).strip()
+        # 如果没有文本，就描述第一个非文本元素
         for seg in raw_message:
             seg_type = seg.get('type')
             if seg_type == 'image': return "[一张图片]"
@@ -123,10 +124,12 @@ def _describe_message_content_sync(raw_message) -> str:
     return "[一条非文本消息]"
 
 async def describe_message_content_async(bot: Bot, msg_info: dict) -> str:
+    """异步地、更智能地描述消息内容，能够处理转发、JSON和缓存。"""
     message_id = msg_info.get("message_id")
     sender_id = msg_info.get("sender", {}).get("user_id")
     raw_message = msg_info.get("message")
 
+    # 检查是否是机器人自己发送的长消息，如果是，则从缓存中读取，避免重复API调用
     if message_id and sender_id and str(sender_id) == bot.self_id:
         cached_content = data_store.get_forward_content_from_cache(message_id)
         if cached_content:
@@ -135,17 +138,20 @@ async def describe_message_content_async(bot: Bot, msg_info: dict) -> str:
     if not isinstance(raw_message, list):
         return _describe_message_content_sync(raw_message)
 
+    # 展开合并转发消息
     forward_id = next((seg.get("data", {}).get("id") for seg in raw_message if seg.get("type") == "forward"), None)
     if forward_id:
         try:
             forwarded_messages = await bot.get_forward_msg(id=forward_id)
             if not forwarded_messages: return "[一段已无法打开的空聊天记录]"
+            # 将聊天记录转换成剧本格式
             script = [f"{m['sender'].get('card') or m['sender'].get('nickname', '未知用户')}: {_describe_message_content_sync(m.get('content'))}" for m in forwarded_messages if _describe_message_content_sync(m.get('content'))]
             return f"[一段聊天记录，内容如下：\n---\n{'\n'.join(script)}\n---]"
         except Exception as e:
             logger.error(f"无法展开聊天记录 (ID: {forward_id}): {e}")
             return "[一段已无法打开的聊天记录]"
 
+    # 解析合并转发中的JSON卡片，提取摘要
     json_seg = next((seg for seg in raw_message if seg.get("type") == "json"), None)
     if json_seg:
         try: return f"[{json.loads(json_seg.get('data',{}).get('data','{}')).get('prompt', '[合并转发]')}]"
@@ -156,9 +162,9 @@ async def describe_message_content_async(bot: Bot, msg_info: dict) -> str:
 async def handle_forwarded_message(bot: Bot, matcher: Matcher, event: Event, forward_id: str):
     logger.info(f"检测到合并转发消息，ID: {forward_id}，正在解析...")
     try:
-        msg_info_for_describe = {"message": [{"type": "forward", "data": {"id": forward_id}}]}
-        desc = await describe_message_content_async(bot, msg_info_for_describe)
+        desc = await describe_message_content_async(bot, {"message": [{"type": "forward", "data": {"id": forward_id}}]})
         user_question = event.get_plaintext().strip()
+        # 构建一个清晰的、包含上下文的Prompt
         prompt = f"请基于以下聊天记录，回答用户的问题。\n\n【聊天记录】\n{desc}\n\n【需要你回答的用户的问题】\n{user_question}"
         await handlers.handle_chat_session(bot, matcher, event, {"role": "user", "content": prompt})
     except Exception as e:
@@ -168,6 +174,7 @@ async def handle_forwarded_message(bot: Bot, matcher: Matcher, event: Event, for
 async def handle_reply_message(bot: Bot, matcher: Matcher, event: Event):
     try:
         replied_msg_info = await bot.get_msg(message_id=event.reply.message_id)
+        # 根据回复的对象是机器人还是其他用户，走不同的处理逻辑
         if replied_msg_info.get('sender', {}).get('user_id') == int(bot.self_id):
             await handle_reply_to_bot(bot, matcher, event, replied_msg_info)
         else:
@@ -192,11 +199,13 @@ async def handle_reply_to_other(bot: Bot, matcher: Matcher, event: Event, replie
     try:
         user_question = event.get_plaintext().strip()
         raw_msg = replied_msg_info.get('message', [])
+        # 检查被回复的消息是否包含图片，如果包含，则优先处理图片
         img_url = next((s.get('data', {}).get('url') for s in raw_msg if s.get('type') == 'image' and s.get('data', {}).get('url')), None)
         
         if img_url:
             async with httpx.AsyncClient() as c:
                 img_b64 = base64.b64encode((await c.get(img_url, timeout=60.0)).content).decode()
+            # 构造多模态消息体
             content = [{"type": "text", "text": f"请分析这张图片并回答用户的问题。\n\n【需要你回答的用户的问题】\n{user_question}"}, 
                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}]
             await handlers.handle_chat_session(bot, matcher, event, {"role": "user", "content": content})
@@ -215,9 +224,10 @@ async def handle_direct_at_message(bot: Bot, matcher: Matcher, event: Event):
         await matcher.finish("喵呜？主人有什么事吗？")
     await handlers.handle_chat_session(bot, matcher, event, {"role": "user", "content": full_text})
 
-# --- 主动聊天处理器 ---
+# --- 主动聊天处理器 (低优先级，不阻塞其他响应) ---
 active_chat_handler = on_message(priority=99, block=False)
 @active_chat_handler.handle()
 async def _(bot: Bot, event: Event):
+    # 仅在群聊中触发主动聊天逻辑
     if isinstance(event, GroupMessageEvent): 
         await handlers.handle_active_chat_check(bot, event)
