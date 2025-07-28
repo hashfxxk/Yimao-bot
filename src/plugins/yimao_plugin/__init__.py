@@ -88,7 +88,7 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
         await matcher.finish() # 结束，防止被当作其他类型消息处理
 
     # b. help 指令
-    if cmd == "help":
+    if cmd.lstrip('/') == "help":
         await matcher.finish(utils.get_help_menu())
 
     # c. restart 指令 (兼容 //restart 和 /restart)
