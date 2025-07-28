@@ -314,6 +314,7 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
     user_text = event.get_plaintext().lstrip('#').strip()
     history = data_store.get_or_create_challenge_history(session_id)
     is_new_game = not history
+
     if user_text.lower() in ["新游戏", "重置", "restart"]:
         data_store.clear_challenge_history(session_id)
         is_new_game = True
@@ -321,10 +322,13 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
     elif not user_text and not is_new_game:
         await matcher.finish("医生，请输入你的诊断问题。")
         return
+
     if not is_new_game:
         user_message_payload = {"role": "user", "content": user_text}
         history.append(user_message_payload)
+
     logger.info(f"会话 {session_id} (猜病挑战) 收到请求 (新游戏: {is_new_game}): '{user_text}'")
+
     try:
         api_response = await llm_client.call_gemini_api(
             messages=list(history),
@@ -332,6 +336,7 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
             model_to_use=config.CHALLENGE_MODEL_NAME,
             use_tools=False
         )
+
         if "error" in api_response:
             error_data = api_response.get("error", {})
             error_msg_from_api = error_data.get("message", "发生未知错误")
@@ -340,16 +345,48 @@ async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
             if history and history[-1]['role'] == 'user':
                 history.pop()
             return
+
         response_content = api_response["choices"][0]["message"].get("content", "")
+        
+        # --- 新增的、更鲁棒的游戏结束判定逻辑 ---
+        game_over = False
+        game_status = None
+        
+        # 1. 尝试从响应中提取游戏状态JSON
+        state_match = re.search(r"<GAME_STATE>(.*)</GAME_STATE>", response_content, re.DOTALL)
+        if state_match:
+            json_str = state_match.group(1).strip()
+            try:
+                # 2. 解析JSON
+                game_data = json.loads(json_str)
+                game_status = game_data.get("status")
+                if game_status in ["victory", "defeat"]:
+                    game_over = True
+                    # 3. 从回复给用户看的内容中，移除状态标记
+                    response_content = response_content[:state_match.start()].strip()
+                    logger.info(f"猜病游戏结束，状态: {game_status}, 原因: {game_data.get('reason')}")
+                else:
+                    logger.warning(f"收到未知的游戏状态: {game_status}")
+
+            except json.JSONDecodeError:
+                logger.error(f"解析游戏状态JSON失败: {json_str}")
+                # 即使解析失败，也移除标记，避免给用户看到
+                response_content = response_content[:state_match.start()].strip()
+
+
         if response_content:
              history.append({"role": "assistant", "content": response_content})
              await matcher.send(Message(response_content))
-             if "Success" in response_content or "Fail" in response_content:
+             
+             # 4. 在发送完最终对话后，处理游戏结束流程
+             if game_over:
                 data_store.clear_challenge_history(session_id)
-                await matcher.send("（游戏已结束，可使用 `#新游戏` 重新开始）")
+                end_message = "（恭喜你达成了胜利结局！🎉）" if game_status == "victory" else "（很遗憾，你达成了失败结局...）"
+                await matcher.send(f"{end_message}\n游戏已结束，可使用 `#新游戏` 重新开始。")
         else:
             logger.warning(f"从猜病挑战API收到了空的响应内容: {api_response}")
             await matcher.send("...信号中断...")
+
     except httpx.HTTPStatusError as e:
         logger.error(f"处理猜病挑战时发生HTTP错误: {e.response.status_code} - {e.response.text}", exc_info=True)
         await matcher.send(f"...[严重错误：与核心逻辑单元的连接失败，状态码: {e.response.status_code}]...")
@@ -514,8 +551,12 @@ async def _(bot: Bot, event: GroupMessageEvent):
     history.append(structured_message)
     logger.debug(f"[记录员 V_Final] 已记录群({group_id})消息: {user_name}: {message_text[:30]}...")
     
-    if user_id != bot.self_id and data_store.increment_and_check_summary_trigger(group_id):
-        asyncio.create_task(update_summary_for_group(group_id, list(history)))
+    if user_id != bot.self_id:
+        # 为主动聊天增加消息计数
+        data_store.increment_active_chat_message_count(group_id)
+        # 检查是否需要触发群聊摘要更新
+        if data_store.increment_and_check_summary_trigger(group_id):
+            asyncio.create_task(update_summary_for_group(group_id, list(history)))
 
 async def _describe_message_content_for_active_chat(bot: Bot, message: Message) -> str:
     """为主动聊天历史记录，简单描述非纯文本消息。"""
@@ -531,14 +572,26 @@ async def _describe_message_content_for_active_chat(bot: Bot, message: Message) 
 # 我们把它放在这里，但让 `__init__.py` 来调用
 async def handle_active_chat_check(bot: Bot, event: GroupMessageEvent):
     """这个处理器只在所有其他处理器都运行完毕后，才根据完整的历史记录进行决策。"""
-    if not config.ACTIVE_CHAT_ENABLED or str(event.group_id) not in config.ACTIVE_CHAT_WHITELIST:
+    group_id = str(event.group_id)
+    
+    # 1. 基础条件检查：功能是否开启，是否在白名单内
+    if not config.ACTIVE_CHAT_ENABLED or group_id not in config.ACTIVE_CHAT_WHITELIST:
         return
-    if not data_store.check_and_set_cooldown(str(event.group_id)):
+        
+    # 2. 【新增】消息计数检查：群聊是否足够“热闹”
+    current_count = data_store.get_active_chat_message_count(group_id)
+    if current_count < config.ACTIVE_CHAT_MESSAGE_THRESHOLD:
+        logger.debug(f"[主动聊天] 群({group_id}) 消息计数未达到阈值 ({current_count}/{config.ACTIVE_CHAT_MESSAGE_THRESHOLD})，跳过决策。")
+        return
+        
+    # 3. 冷却时间检查：距离上次主动发言是否足够久
+    if not data_store.check_and_set_cooldown(group_id):
+        logger.debug(f"[主动聊天] 群({group_id}) 尚在冷却时间内，跳过决策。")
         return
 
-    group_id = str(event.group_id)
     history = data_store.get_group_history(group_id)
     if not history: return
+
 
     group_summary = data_store.get_group_summary(group_id)
 
@@ -589,6 +642,9 @@ async def handle_active_chat_check(bot: Bot, event: GroupMessageEvent):
             if reply_text:
                 logger.info(f"[主动聊天] 决定回复群({group_id})，内容: {reply_text}")
                 await bot.send(event, message=reply_text)
+                
+                # 【核心修改】成功发言后，立即重置消息计数器
+                data_store.reset_active_chat_message_count(group_id)
                 
                 bot_name = (await bot.get_login_info())['nickname'] or "一猫"
                 structured_message = {

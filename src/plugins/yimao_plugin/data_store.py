@@ -42,6 +42,7 @@ _group_summaries: Dict[str, str] = {}
 _group_message_counters: Dict[str, int] = {}
 _group_chat_history: Dict[str, Deque[str]] = {}
 _group_cooldown_timers: Dict[str, float] = {}
+_group_active_chat_message_counts: Dict[str, int] = {}
 # 缓存机器人自己发送的合并转发内容，避免在处理对自己的回复时无法获取上下文。
 # Key: message_id (int), Value: content (str)
 _forward_content_cache: Dict[int, str] = {}
@@ -172,6 +173,22 @@ def get_active_history(session_id: str, mode: str) -> deque:
     if active_index not in _history_deques[session_id][mode]:
          _history_deques[session_id][mode][active_index] = deque(maxlen=config.NORMAL_CHAT_MAX_LENGTH if mode == "normal" else config.SLASH_CHAT_MAX_LENGTH)
     return _history_deques[session_id][mode][active_index]
+
+def get_active_chat_message_count(group_id: str) -> int:
+    """获取指定群组的当前主动聊天消息计数。"""
+    return _group_active_chat_message_counts.get(group_id, 0)
+
+def increment_active_chat_message_count(group_id: str):
+    """为指定群组的主动聊天消息计数器+1。"""
+    count = _group_active_chat_message_counts.get(group_id, 0)
+    _group_active_chat_message_counts[group_id] = count + 1
+    logger.debug(f"群({group_id}) 主动聊天计数器增加到: {_group_active_chat_message_counts[group_id]}")
+
+def reset_active_chat_message_count(group_id: str):
+    """重置指定群组的主动聊天消息计数器为0。"""
+    if group_id in _group_active_chat_message_counts:
+        _group_active_chat_message_counts[group_id] = 0
+        logger.info(f"群({group_id}) 主动聊天计数器已重置为0。")
 
 def update_slot_summary_if_needed(session_id: str, mode: str, prompt: str):
     user_mem = _get_or_create_user_memory(session_id)
