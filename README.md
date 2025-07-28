@@ -80,7 +80,7 @@ ACTIVE_CHAT_GROUP_IDS=11111,22222,33333
 
 **b) 创建 `jm_option.yml` 文件 (用于JMComic下载)**
 
-这是一个最小化的配置示例，你可以根据 [Jmcomic官方文档([https://github.com/hect0x7/JMComic-Crawler-Python]) 进行更详细的配置。
+这是一个最小化的配置示例，你可以根据 [Jmcomic官方文档](https://github.com/hect0x7/JMComic-Crawler-Python) 进行更详细的配置。
 
 ```yaml
 # jm_option.yml
