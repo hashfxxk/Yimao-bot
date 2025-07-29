@@ -43,8 +43,8 @@ async def call_gemini_api(messages: list, system_prompt_content: str, model_to_u
         payload["tools"] = tools.tools_definition_openai
         payload["tool_choice"] = "auto"
 
-    MAX_RETRIES = 3
-    RETRY_DELAY = 5
+    MAX_RETRIES = 5
+    RETRY_DELAY = 10
 
     for attempt in range(MAX_RETRIES):
         try:

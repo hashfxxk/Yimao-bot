@@ -2,56 +2,72 @@
 import asyncio
 import httpx
 import logging
-import datetime
-from ddgs import DDGS
+import requests
 from . import config
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 
 logger = logging.getLogger("GeminiPlugin.tools")
 
-def get_current_time() -> str:
-    """获取当前日期和时间"""
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 async def search_web(query: str) -> str:
-    """执行通用的网页搜索。"""
-    logger.info(f"正在执行通用网页搜索: {query}")
+    """使用 Google Programmable Search Engine 执行通用的网页搜索。"""
+    logger.info(f"正在使用 Google API 执行网页搜索: {query}")
     try:
-        def _sync_search():
-            results = DDGS().text(query, max_results=5)
-            if not results:
-                return "没有找到相关信息。"
+        def _sync_google_search():
+            # 【全新实现，使用requests，代理支持更好】
+            proxies = {}
+            if config.HTTP_PROXY:
+                # requests库能自动处理 http/https/socks 代理
+                # 关键：SOCKS5代理需要写成 socks5h://
+                proxy_url = f"socks5h://{config.HTTP_PROXY.split('//')[1]}"
+                proxies['http'] = proxy_url
+                proxies['https' ] = proxy_url
+                logger.info(f"已配置代理: {proxies}")
+
+            # Google API的URL
+            api_url = "https://www.googleapis.com/customsearch/v1"
+            
+            params = {
+                'key': config.GOOGLE_API_KEY,
+                'cx': config.GOOGLE_CSE_ID,
+                'q': query,
+                'num': 5
+            }
+
+            response = requests.get(api_url, params=params, proxies=proxies, timeout=20)
+            response.raise_for_status() # 如果状态码不是2xx，则抛出异常
+            
+            res = response.json()
+
+            if not res.get('items'):
+                return f"通过 Google 搜索“{query}”没有找到相关信息。"
+            
+            results = res['items']
             formatted_results = "\n".join(
-                [f"- **{r['title']}**: {r['body']}" for r in results]
+                [f"- **{r['title']}**: {r.get('snippet', '无摘要')}" for r in results]
             )
-            return f"这是关于“{query}”的搜索结果：\n{formatted_results}"
+            return f"这是关于“{query}”的Google搜索结果：\n{formatted_results}"
 
-        result_str = await asyncio.to_thread(_sync_search)
+        result_str = await asyncio.to_thread(_sync_google_search)
         return result_str
 
+    except requests.exceptions.ProxyError as e:
+        logger.error(f"代理连接失败: {e}", exc_info=True)
+        return "工具错误：无法连接到本地代理服务器，请检查代理软件是否开启或端口是否正确。"
+    except requests.exceptions.Timeout:
+        logger.error(f"请求Google API超时")
+        return "工具错误：通过代理访问Google API超时，请检查代理节点是否通畅。"
+    except requests.exceptions.RequestException as e:
+        logger.error(f"请求Google API时发生网络错误: {e}", exc_info=True)
+        if e.response is not None and e.response.status_code == 429:
+             return "工具错误：今天使用 Google 搜索的次数已经用完啦，请明天再试吧！"
+        return f"工具错误：Google搜索服务出现网络问题。"
     except Exception as e:
-        logger.error(f"网页搜索失败: {e}", exc_info=True)
-        return f"工具错误：网页搜索功能在执行查询“{query}”时遇到网络问题或内部错误，无法获取结果。"
-
-async def search_news(query: str) -> str:
-    """通过一个精确的、硬编码的网页搜索查询来获取最新的新闻头条。"""
-    effective_query = "今日最新国内国际新闻头条摘要"
-    logger.info(f"新闻搜索请求被触发。忽略原始查询 '{query}'，使用硬编码的有效查询: '{effective_query}'")
-    
-    try:
-        def _sync_search_news():
-            with DDGS() as ddgs:
-                results = list(ddgs.text(effective_query, region="cn-zh", max_results=7))
-                if not results:
-                    logger.error(f"致命错误：使用精确查询 '{effective_query}' 仍然无法通过通用搜索获取新闻。")
-                    return "抱歉，搜索新闻的功能似乎暂时失效了。"
-                return "\n\n".join([f"标题: {r['title']}\n链接: {r['href']}\n摘要: {r['body']}" for r in results])
-
-        result_str = await asyncio.to_thread(_sync_search_news)
-        return result_str
-        
-    except Exception as e:
-        logger.error(f"在执行定向新闻搜索时发生严重错误: {e}", exc_info=True)
-        return f"新闻搜索功能出现故障: {e}"
+        logger.error(f"Google网页搜索失败: {e}", exc_info=True)
+        return f"工具错误：网页搜索功能在执行查询“{query}”时遇到内部错误。"
 
 
 async def search_weather(location: str) -> str:
@@ -109,18 +125,44 @@ async def search_weather(location: str) -> str:
             logger.error(f"查询天气时发生未知错误: {e}", exc_info=True)
             return f"查询天气时发生了未知错误: {e}"
 
-# 注册所有可用工具
 available_tools = {
-    "get_current_time": get_current_time,
     "search_web": search_web,
-    "search_news": search_news,
     "search_weather": search_weather,
 }
 
-# 向AI模型声明工具的定义
 tools_definition_openai = [
-    {"type": "function", "function": {"name": "get_current_time", "description": "获取当前日期和时间", "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {"name": "search_web", "description": "搜索通用的网页信息，用于回答事实性、知识性的问题。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "搜索关键词"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "search_news", "description": "获取最新的新闻头条和时事。当用户询问‘今日头条’、‘最新新闻’时，应使用此工具。", "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "此参数可以忽略，函数会自动获取新闻。"}}, "required": ["query"]}}},
-    {"type": "function", "function": {"name": "search_weather", "description": "查询指定城市的实时天气信息和未来7天的天气预报。当用户询问未来天气（如“明天天气怎么样”）时，应使用此工具。", "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "需要查询天气的城市名称，例如 '北京', '上海', 'London' 等。"}}, "required": ["location"]}}}
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web", 
+            "description": "用于搜索互联网上的实时信息。当需要回答关于最新事件、新闻、事实、定义，或者任何用户提到的、你不确定的新词、新概念、'梗'时，都应该使用此工具。这是获取你知识库之外信息的主要方式。",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "query": {
+                        "type": "string", 
+                        "description": "要搜索的关键词或问题。例如：'今日头条' 或 '“Meme”是什么意思？'"
+                    }
+                }, 
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function", 
+        "function": {
+            "name": "search_weather", 
+            "description": "查询指定城市的实时天气信息和未来7天的天气预报。",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "location": {
+                        "type": "string", 
+                        "description": "需要查询天气的城市名称，例如 '北京', '上海', 'London'。"
+                    }
+                }, 
+                "required": ["location"]
+            }
+        }
+    }
 ]
