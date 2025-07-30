@@ -9,6 +9,7 @@ import shutil
 import re
 import httpx
 import datetime
+import time
 from urllib.parse import urlparse, urlunparse
 from pathlib import Path
 from typing import Literal
@@ -19,7 +20,9 @@ from jmcomic.jm_exception import MissingAlbumPhotoException, PartialDownloadFail
 from nonebot import on_message
 from nonebot.rule import Rule
 from nonebot.matcher import Matcher
+from nonebot.typing import T_State
 from nonebot.params import CommandArg
+from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, GroupMessageEvent, MessageSegment
 
 from . import config, data_store, llm_client, tools, utils
@@ -297,104 +300,173 @@ async def handle_memory_command(matcher: Matcher, event: Event, args: Message = 
         except ValueError:
             await matcher.send("无效的指令。请输入数字编号。")
 
-async def handle_clear_command(matcher: Matcher, event: Event):
-    session_id = event.get_session_id()
-    command = event.get_plaintext().strip()
-    mode = "slash" if command.startswith('//') else "normal"
-    result_message = data_store.clear_active_slot(session_id, mode)
-    await matcher.send(result_message)
-    data_store.save_memory_to_file()
-
-
-
-
 
 async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
+
+    # --- 1. 初始化与上下文获取 ---
     session_id = event.get_session_id()
+    user_id_str = str(event.user_id)
     user_text = event.get_plaintext().lstrip('#').strip()
     history = data_store.get_or_create_challenge_history(session_id)
-    is_new_game = not history
+    player_name = event.sender.card or event.sender.nickname or user_id_str
+    shopkeeper_name = f"{player_name}的神秘店长"
+    group_id_str = str(event.group_id) if isinstance(event, GroupMessageEvent) else None
 
-    if user_text.lower() in ["新游戏", "重置", "restart"]:
-        data_store.clear_challenge_history(session_id)
-        is_new_game = True
-        history = data_store.get_or_create_challenge_history(session_id)
-    elif not user_text and not is_new_game:
-        await matcher.finish("医生，请输入你的诊断问题。")
+    # --- 指令处理 ---
+    # 【新增】排行榜指令
+    if user_text.lower() in ["rank", "排行榜", "leaderboard"]:
+        if not group_id_str:
+            await matcher.send("排行榜功能仅在群聊中可用哦。")
+            return
+        leaderboard = data_store.get_leaderboard(group_id_str)
+        if not leaderboard:
+            await matcher.send("本群还没有人成功攻略猫娘，快来成为第一人吧！")
+            return
+            
+        rank_list = ["🏆 本群猫娘速通排行榜 🏆"]
+        for i, record in enumerate(leaderboard):
+            # 为了保护隐私，此处默认显示昵称，括号内是QQ号用于区分重名
+            rank_list.append(f"第 {i+1} 名: {record.get('user_name', '未知玩家')} ({record.get('user_id', '未知ID')})\n所用字数: {record.get('char_count', 'N/A')}")
+        
+        await matcher.send("\n\n".join(rank_list))
         return
 
-    if not is_new_game:
+    # 【修改】历史记录指令保持不变
+    if user_text.lower() in ["history", "历史"]:
+        if not history:
+            await matcher.send("你和猫娘们还没有任何对话记录哦，快去开启故事吧！")
+            return
+
+        history_text_parts = []
+        for record in history:
+            role = record.get("role")
+            content = record.get("content", "")
+            if role == "user":
+                history_text_parts.append(f"你：{content}")
+            elif role == "assistant":
+                history_text_parts.append(f"旁白/猫娘：\n{content}")
+        
+        full_history_text = "\n\n---\n\n".join(history_text_parts)
+        await utils.send_long_message_as_forward(
+            bot, event, full_history_text, f"{player_name}的游戏记录"
+        )
+        return
+        
+    # --- 游戏逻辑 ---
+    if isinstance(event, GroupMessageEvent):
+        try: await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
+        except: pass
+
+    # 【修改】游戏重置时，也要重置字数计数器
+    is_reset_command = user_text.lower() in ["新游戏", "重置", "restart"]
+    is_new_game = is_reset_command or not history
+    messages_for_api = []
+    if is_new_game:
+        history.clear()
+        data_store.reset_challenge_char_count(session_id) # 重置字数
+        if is_reset_command: await matcher.send("...记忆已重置，咖啡馆的故事重新开始了。")
+        messages_for_api = []
+    else:
+        # 【修改】将用户输入的字数计入
+        data_store.increment_challenge_char_count(session_id, user_text)
         user_message_payload = {"role": "user", "content": user_text}
         history.append(user_message_payload)
+        messages_for_api = list(history)
 
-    logger.info(f"会话 {session_id} (猜病挑战) 收到请求 (新游戏: {is_new_game}): '{user_text}'")
+    logger.info(f"会话 {session_id} (店长: {shopkeeper_name}) - 新游戏: {is_new_game} | 用户输入: '{user_text}'")
 
     try:
         api_response = await llm_client.call_gemini_api(
-            messages=list(history),
+            messages=messages_for_api,
             system_prompt_content=config.CHALLENGE_SYSTEM_PROMPT,
             model_to_use=config.CHALLENGE_MODEL_NAME,
             use_tools=False
         )
 
         if "error" in api_response:
-            error_data = api_response.get("error", {})
-            error_msg_from_api = error_data.get("message", "发生未知错误")
-            logger.error(f"猜病挑战API调用失败: {error_msg_from_api}")
-            await matcher.send(f"诊断设备出错了: {error_msg_from_api}")
-            if history and history[-1]['role'] == 'user':
-                history.pop()
-            return
+            raise RuntimeError(api_response.get("error", {}).get("message", "发生未知API错误"))
 
-        response_content = api_response["choices"][0]["message"].get("content", "")
+        full_response_content = api_response["choices"][0]["message"].get("content", "")
         
-        # --- 新增的、更鲁棒的游戏结束判定逻辑 ---
-        game_over = False
-        game_status = None
+        game_state_jsons = re.findall(r"<GAME_STATE>(.*?)</GAME_STATE>", full_response_content, re.DOTALL)
+        narrative_content = re.sub(r"<GAME_STATE>.*?</GAME_STATE>", "", full_response_content, flags=re.DOTALL).strip()
         
-        # 1. 尝试从响应中提取游戏状态JSON
-        state_match = re.search(r"<GAME_STATE>(.*)</GAME_STATE>", response_content, re.DOTALL)
-        if state_match:
-            json_str = state_match.group(1).strip()
+        feedback_messages = []
+        has_victory = False # 【新增】标记本回合是否达成了攻略
+        for json_str in game_state_jsons:
             try:
-                # 2. 解析JSON
                 game_data = json.loads(json_str)
-                game_status = game_data.get("status")
-                if game_status in ["victory", "defeat"]:
-                    game_over = True
-                    # 3. 从回复给用户看的内容中，移除状态标记
-                    response_content = response_content[:state_match.start()].strip()
-                    logger.info(f"猜病游戏结束，状态: {game_status}, 原因: {game_data.get('reason')}")
-                else:
-                    logger.warning(f"收到未知的游戏状态: {game_status}")
+                status, char = game_data.get("status"), game_data.get("character", "她")
+                feedback = ""
+                if status == "trust_up": feedback = f"（{char}对你的信赖似乎上升了。{game_data.get('reason', '')}）"
+                elif status == "trust_down": feedback = f"（{char}对你的信赖似乎下降了。{game_data.get('reason', '')}）"
+                elif status == "victory":
+                    feedback = f"（🎉🎉🎉 恭喜！你与{char}的羁绊达成了！现在可以和她进行更深入的日常互动了~）"
+                    has_victory = True # 标记为胜利
+                if feedback: feedback_messages.append(feedback)
+            except json.JSONDecodeError: logger.error(f"解析游戏状态JSON失败: {json_str}")
+        
+        # --- 整合与发送 ---
+        feedback_block = "\n".join(feedback_messages)
+        
+        # 【修改】在反馈块后追加字数统计
+        current_char_count = data_store.get_challenge_char_count(session_id)
+        char_count_feedback = f"(本局游戏您已输入 {current_char_count} 字)"
+        
+        final_content_parts = []
+        if narrative_content: final_content_parts.append(narrative_content)
+        if feedback_block: final_content_parts.append(feedback_block)
+        
+        # 总是添加字数统计反馈
+        final_content_parts.append(char_count_feedback)
+        
+        # 使用两个换行符分隔，视觉效果更好
+        final_content = "\n\n".join(part for part in final_content_parts if part).strip()
 
-            except json.JSONDecodeError:
-                logger.error(f"解析游戏状态JSON失败: {json_str}")
-                # 即使解析失败，也移除标记，避免给用户看到
-                response_content = response_content[:state_match.start()].strip()
+        if final_content:
+            if narrative_content:
+                history.append({"role": "assistant", "content": narrative_content})
 
+            if len(final_content) > config.FORWARD_TRIGGER_THRESHOLD:
+                await utils.send_long_message_as_forward(bot, event, final_content, shopkeeper_name)
+            else:
+                await matcher.send(Message(final_content))
+        elif not is_new_game:
+            await matcher.send("...她似乎没什么反应。")
 
-        if response_content:
-             history.append({"role": "assistant", "content": response_content})
-             await matcher.send(Message(response_content))
-             
-             # 4. 在发送完最终对话后，处理游戏结束流程
-             if game_over:
-                data_store.clear_challenge_history(session_id)
-                end_message = "（恭喜你达成了胜利结局！🎉）" if game_status == "victory" else "（很遗憾，你达成了失败结局...）"
-                await matcher.send(f"{end_message}\n游戏已结束，可使用 `#新游戏` 重新开始。")
-        else:
-            logger.warning(f"从猜病挑战API收到了空的响应内容: {api_response}")
-            await matcher.send("...信号中断...")
+        # 【新增】处理胜利和排行榜逻辑
+        if has_victory and group_id_str:
+            # 检查此玩家是否已在本局游戏中上过榜，防止重复记录
+            # 一个简单的检查方法：如果历史记录中已经有超过一个victory，说明不是第一次
+            # 注意：这里的检查是在本次回复的内容加入history之前，所以判断数量为1
+            victory_count_in_history = sum(1 for msg in history if msg.get('role') == 'assistant' and "恭喜！你与" in msg.get("content", ""))
+            
+            if victory_count_in_history == 0: # 如果历史中还没有胜利记录，说明这是第一次
+                data_store.update_leaderboard(group_id_str, user_id_str, player_name, current_char_count)
+                await matcher.send(f"🎉恭喜 {player_name} 首次攻略成功！您的成绩已记录到本群速通排行榜！\n使用 `#排行榜` 查看。")
 
-    except httpx.HTTPStatusError as e:
-        logger.error(f"处理猜病挑战时发生HTTP错误: {e.response.status_code} - {e.response.text}", exc_info=True)
-        await matcher.send(f"...[严重错误：与核心逻辑单元的连接失败，状态码: {e.response.status_code}]...")
+        if isinstance(event, GroupMessageEvent):
+            try:
+                await bot.call_api("unset_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
+                await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10024')
+            except: pass
+            
     except Exception as e:
-        if history and not is_new_game and history[-1]['role'] == 'user':
+        if not is_new_game and history and history[-1]['role'] == 'user':
             history.pop()
-        logger.error(f"处理猜病挑战时发生未知错误: {e}", exc_info=True)
-        await matcher.send("...[严重错误：诊断模块发生未知故障]...")
+        logger.error(f"处理猫娘咖啡馆时发生错误: {e}", exc_info=True)
+        await matcher.send(f"...[叙事模块故障: {e}]...")
+        
+        if isinstance(event, GroupMessageEvent):
+            try:
+                await bot.call_api("unset_msg_emoji_like", message_id=event.message_id, emoji_id='128164')
+                await bot.call_api("set_msg_emoji_like", message_id=event.message_id, emoji_id='10060')
+            except: pass
+
+
+
+
+            
 
 async def update_summary_for_group(group_id: str, history_list: list):
     logger.info(f"正在为群组 {group_id} 生成摘要...")

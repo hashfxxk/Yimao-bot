@@ -5,7 +5,7 @@ import os
 from collections import deque
 from pathlib import Path
 import time
-from typing import Dict, List, Deque, Optional
+from typing import Dict, List, Deque, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -44,9 +44,10 @@ _group_chat_history: Dict[str, Deque[str]] = {}
 _group_cooldown_timers: Dict[str, float] = {}
 _group_active_chat_message_counts: Dict[str, int] = {}
 # 缓存机器人自己发送的合并转发内容，避免在处理对自己的回复时无法获取上下文。
-# Key: message_id (int), Value: content (str)
 _forward_content_cache: Dict[int, str] = {}
-
+_challenge_char_counts: Dict[str, int] = {} # Key: session_id, Value: 当前游戏的总字数
+_challenge_victory_leaderboard: Dict[str, List[Dict]] = {} # Key: group_id, Value: List of {'user_id': str, 'user_name': str, 'char_count': int}
+_restart_confirm_sessions: Dict[str, Tuple[float, str]] = {}
 
 #文件持久化
 
@@ -55,6 +56,13 @@ def _get_memory_path() -> Path:
 
 def _get_group_summary_path() -> Path:
     return Path(config.MEMORY_FILE_PATH).parent / "yimao_group_summaries.json"
+
+def _get_challenge_histories_path() -> Path:
+    return Path(config.CHALLENGE_HISTORIES_FILE_PATH)
+
+def _get_challenge_leaderboard_path() -> Path:
+    return Path(config.CHALLENGE_LEADERBOARD_FILE_PATH)
+
 
 def load_memory_from_file():
     global _user_memory_data, _history_deques
@@ -97,6 +105,41 @@ def load_group_summaries_from_file():
             os.rename(path, backup_path)
         _group_summaries = {}
 
+def load_challenge_histories_from_file():
+    """从文件加载所有用户的猜病挑战历史记录。"""
+    global _challenge_histories
+    path = _get_challenge_histories_path()
+    if not path.exists():
+        logger.info(f"猜病游戏历史文件 {path} 不存在，将以空历史开始。")
+        return
+    try:
+        data = json.loads(path.read_text("utf-8"))
+        # 关键一步：将加载的 list 转换回 deque
+        for session_id, history_list in data.items():
+            _challenge_histories[session_id] = deque(history_list, maxlen=config.CHALLENGE_CHAT_MAX_LENGTH)
+        logger.info(f"成功从 {path} 加载了 {len(_challenge_histories)} 个猜病游戏会话。")
+    except Exception as e:
+        logger.error(f"加载猜病游戏历史文件 {path} 失败: {e}。将创建备份并开始新游戏。")
+        if path.exists():
+            backup_path = path.with_suffix(f".bak.{os.urandom(4).hex()}")
+            os.rename(path, backup_path)
+        _challenge_histories = {}
+
+def load_challenge_leaderboard_from_file():
+    """从文件加载所有群组的猜病游戏排行榜。"""
+    global _challenge_victory_leaderboard
+    path = _get_challenge_leaderboard_path()
+    if not path.exists():
+        logger.info(f"猜病游戏排行榜文件 {path} 不存在，将以空榜开始。")
+        return
+    try:
+        _challenge_victory_leaderboard = json.loads(path.read_text("utf-8"))
+        logger.info(f"成功从 {path} 加载了 {len(_challenge_victory_leaderboard)} 个群组的排行榜。")
+    except Exception as e:
+        logger.error(f"加载猜病游戏排行榜文件 {path} 失败: {e}。")
+        _challenge_victory_leaderboard = {}
+
+
 def save_memory_to_file():
     path = _get_memory_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -121,6 +164,28 @@ def save_group_summaries_to_file():
     try: path.write_text(json.dumps(_group_summaries, ensure_ascii=False, indent=2), "utf-8")
     except Exception as e: logger.error(f"保存群组摘要至 {path} 时出错: {e}", exc_info=True)
 
+def save_challenge_histories_to_file():
+    """将所有用户的猜病挑战历史记录保存到文件。"""
+    path = _get_challenge_histories_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data_to_save = {}
+    # 关键一步：将 deque 转换为 list 以便JSON序列化
+    for session_id, history_deque in _challenge_histories.items():
+        data_to_save[session_id] = list(history_deque)
+    
+    try:
+        path.write_text(json.dumps(data_to_save, ensure_ascii=False, indent=2), "utf-8")
+    except Exception as e:
+        logger.error(f"保存猜病游戏历史至 {path} 时出错: {e}", exc_info=True)
+
+def save_challenge_leaderboard_to_file():
+    """将所有群组的猜病游戏排行榜保存到文件。"""
+    path = _get_challenge_leaderboard_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(json.dumps(_challenge_victory_leaderboard, ensure_ascii=False, indent=2), "utf-8")
+    except Exception as e:
+        logger.error(f"保存猜病游戏排行榜至 {path} 时出错: {e}", exc_info=True)
 
 def cache_forward_content(message_id: int, content: str):
     """缓存一条由机器人发送的合并转发消息的原始内容。"""
@@ -260,4 +325,67 @@ def find_user_question_id_by_bot_response_id(group_id: str, bot_message_id: int)
                             logger.info(f"找到匹配！机器人消息 {bot_message_id} 是对用户消息 {original_question_id} 的回应。")
                             return original_question_id
     logger.warning(f"在群组 {group_id} 的所有实时记忆中，未能找到机器人消息 {bot_message_id} 的原始提问。")
+    return None
+
+
+def get_challenge_char_count(session_id: str) -> int:
+    """获取当前游戏的字数统计。"""
+    return _challenge_char_counts.get(session_id, 0)
+
+def increment_challenge_char_count(session_id: str, text: str):
+    """为当前游戏增加字数。"""
+    count = _challenge_char_counts.get(session_id, 0)
+    _challenge_char_counts[session_id] = count + len(text)
+
+def reset_challenge_char_count(session_id: str):
+    """重置当前游戏的字数统计。"""
+    if session_id in _challenge_char_counts:
+        _challenge_char_counts[session_id] = 0
+        
+def get_leaderboard(group_id: str) -> List[Dict]:
+    """获取指定群组的排行榜。"""
+    return _challenge_victory_leaderboard.get(group_id, [])
+
+def update_leaderboard(group_id: str, user_id: str, user_name: str, char_count: int):
+    """更新指定群组的排行榜。"""
+    if group_id not in _challenge_victory_leaderboard:
+        _challenge_victory_leaderboard[group_id] = []
+    
+    leaderboard = _challenge_victory_leaderboard[group_id]
+    leaderboard.append({
+        "user_id": user_id,
+        "user_name": user_name,
+        "char_count": char_count
+    })
+    
+    # 按字数升序排序，并只保留前10名
+    leaderboard.sort(key=lambda x: x['char_count'])
+    _challenge_victory_leaderboard[group_id] = leaderboard[:10]
+    
+    logger.info(f"群({group_id})排行榜已更新，正在保存...")
+    save_challenge_leaderboard_to_file() # 立即保存
+
+
+def set_restart_confirmation(session_id: str, mode: str):
+    """设置一个用户的重启确认状态，并记录时间戳。"""
+    _restart_confirm_sessions[session_id] = (time.time(), mode)
+    logger.info(f"会话 {session_id} 已发起 {mode} 模式的重启确认。")
+
+def check_and_clear_restart_confirmation(session_id: str) -> Optional[str]:
+    """
+    检查一个用户的重启确认状态。
+    如果存在且未超时（30秒内），则返回模式并清除状态。
+    否则返回 None。
+    """
+    if session_id in _restart_confirm_sessions:
+        timestamp, mode = _restart_confirm_sessions[session_id]
+        if time.time() - timestamp <= 30.0:
+            # 在有效期内，清除状态并返回模式
+            del _restart_confirm_sessions[session_id]
+            logger.info(f"会话 {session_id} 的重启确认已验证。")
+            return mode
+        else:
+            # 已超时，清除状态
+            del _restart_confirm_sessions[session_id]
+            logger.info(f"会话 {session_id} 的重启确认已超时。")
     return None

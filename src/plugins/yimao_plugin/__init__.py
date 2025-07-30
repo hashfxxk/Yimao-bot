@@ -10,6 +10,7 @@ from typing import Optional
 from nonebot import get_driver, on_command, on_message
 from nonebot.rule import to_me
 from nonebot.matcher import Matcher
+from nonebot.adapters.onebot.v11 import MessageEvent
 from nonebot.params import CommandArg
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, GroupMessageEvent
 
@@ -27,6 +28,10 @@ async def on_startup():
     data_store.load_memory_from_file()
     logger.info("正在加载群组长期记忆摘要...")
     data_store.load_group_summaries_from_file()
+    logger.info("正在加载猜病游戏历史...") 
+    data_store.load_challenge_histories_from_file() 
+    logger.info("正在加载猜病游戏排行榜...") 
+    data_store.load_challenge_leaderboard_from_file() 
     logger.info("一猫AI插件已加载并准备就绪。")
 
 @driver.on_shutdown
@@ -36,7 +41,11 @@ async def on_shutdown():
     data_store.save_memory_to_file()
     logger.info("正在保存群组长期记忆摘要...")
     data_store.save_group_summaries_to_file()
-    logger.info("用户记忆和群组摘要已保存。")
+    logger.info("正在保存猜病游戏历史...") 
+    data_store.save_challenge_histories_to_file() 
+    logger.info("正在保存猜病游戏排行榜...") 
+    data_store.save_challenge_leaderboard_to_file() 
+    logger.info("用户记忆、群组摘要、游戏历史和排行榜已保存。") 
 
 
 # --- 指令注册 ---
@@ -68,36 +77,61 @@ async def _(bot: Bot, event: Event, matcher: Matcher):
 # 这个处理器将接管所有@机器人的消息，并进行智能分发
 at_me_handler = on_message(rule=to_me(), priority=10, block=True)
 @at_me_handler.handle()
-async def _(bot: Bot, matcher: Matcher, event: Event):
-    # 1. 优先处理合并转发，这是一个非常特殊的场景
-    forward_id = next((seg.data["id"] for seg in event.message if seg.type == "forward"), None)
-    if forward_id:
-        await handle_forwarded_message(bot, matcher, event, forward_id)
-        return # 处理完转发后直接结束
-
-    # 2. 获取纯文本内容，为指令解析做准备
+async def _(bot: Bot, matcher: Matcher, event: Event): 
+    # 1. 获取纯文本内容，为指令解析做准备
     text = event.get_plaintext().strip()
     cmd_parts = text.split()
     cmd = cmd_parts[0].lower() if cmd_parts else ""
 
-    # 3. 【核心修正】指令分发系统：优先检查是否是特定指令，无论是否为回复
+    if cmd.lstrip('/') == "restart":
+        session_id = event.get_session_id()
+        
+        # 检查是否是第二次确认
+        confirmed_mode = data_store.check_and_clear_restart_confirmation(session_id)
+        
+        if confirmed_mode:
+            # 是第二次确认，且在有效期内
+            # 再次检查本次输入的指令模式是否与上次发起时一致
+            current_mode = "slash" if cmd.startswith('//') else "normal"
+            if current_mode == confirmed_mode:
+                result_message = data_store.clear_active_slot(session_id, confirmed_mode)
+                await matcher.finish(f"已确认。{result_message}")
+                data_store.save_memory_to_file()
+            else:
+                await matcher.finish("模式不匹配，已取消清空操作。")
+        else:
+            # 是第一次请求，或之前的请求已超时
+            # 1. 设置确认状态
+            current_mode = "slash" if cmd.startswith('//') else "normal"
+            data_store.set_restart_confirmation(session_id, current_mode)
+            
+            # 2. 发送提示
+            cmd_prefix = "//" if current_mode == "slash" else "/"
+            await matcher.send(
+                f"⚠️警告：您确定要清空当前【{current_mode.capitalize()}模式】的记忆吗？\n"
+                f"这个操作无法撤销！\n"
+                f"请在30秒内再次输入 @一猫 {cmd_prefix}restart 进行确认。"
+            )
+        # restart 指令处理完毕，直接返回
+        return
+
+    # 1. 优先处理合并转发...
+    forward_id = next((seg.data["id"] for seg in event.message if seg.type == "forward"), None)
+    if forward_id:
+        await handle_forwarded_message(bot, matcher, event, forward_id)
+        return
+
     # a. 猜病指令
     if text.startswith("#"):
         logger.debug(f"检测到猜病指令，分发至 handle_challenge_chat...")
         await handlers.handle_challenge_chat(bot, matcher, event)
-        await matcher.finish() # 结束，防止被当作其他类型消息处理
+        await matcher.finish()
 
     # b. help 指令
     if cmd.lstrip('/') == "help":
         await matcher.finish(utils.get_help_menu())
 
-    # c. restart 指令 (兼容 //restart 和 /restart)
-    if cmd.lstrip('/') == "restart":
-        logger.debug(f"检测到 restart 指令，分发至 handle_clear_command...")
-        await handlers.handle_clear_command(matcher, event)
-        return
-
-    # d. memory 指令 (兼容 //memory, /memory, 和 memory)
+    # c. memory 指令
     if cmd.lstrip('/') == "memory":
         logger.debug(f"检测到 memory 指令，分发至 handle_memory_command...")
         args_text = text.split(maxsplit=1)[1] if len(cmd_parts) > 1 else ""
@@ -105,19 +139,15 @@ async def _(bot: Bot, matcher: Matcher, event: Event):
         await handlers.handle_memory_command(matcher, event, args=args_msg)
         return
         
-    # --- 指令解析结束 ---
-
-    # 4. 如果不是任何已知指令，再判断消息类型以进行上下文处理
-    # a. 如果是引用回复 (并且我们已经知道它不是指令)
+    # 如果是引用回复...
     if event.reply:
         logger.debug(f"检测到非指令的引用回复，分发至 handle_reply_message...")
         await handle_reply_message(bot, matcher, event)
         return
 
-    # b. 如果是普通的@消息 (非指令、非转发、非回复)
+    # 如果是普通的@消息...
     logger.debug(f"检测到直接@消息，分发至通用聊天处理器...")
     await handle_direct_at_message(bot, matcher, event)
-
 
 # --- 复杂消息处理辅助函数 ---
 
