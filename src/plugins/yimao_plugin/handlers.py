@@ -598,7 +598,12 @@ async def _(bot: Bot, event: GroupMessageEvent):
     """
     这个处理器拥有最高优先级，像一个忠实的书记官，
     在任何功能被触发之前，就将所有群聊消息记录到历史中。
+    【已升级】现在能正确处理 @ 和 回复。
     """
+    # 只处理群聊消息
+    if not isinstance(event, GroupMessageEvent):
+        return
+        
     group_id = str(event.group_id)
     user_id = str(event.user_id)
     history = data_store.get_group_history(group_id)
@@ -609,9 +614,8 @@ async def _(bot: Bot, event: GroupMessageEvent):
     except Exception:
         user_name = event.sender.nickname or user_id
         
-    message_text = event.get_plaintext().strip()
-    if not message_text:
-        message_text = await _describe_message_content_for_active_chat(bot, event.message)
+    # 【核心修改】使用我们新的格式化函数来获取完整的消息内容
+    message_text = await format_message_for_history(bot, event)
     
     structured_message = {
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -621,24 +625,80 @@ async def _(bot: Bot, event: GroupMessageEvent):
         "is_bot": user_id == bot.self_id
     }
     history.append(structured_message)
-    logger.debug(f"[记录员 V_Final] 已记录群({group_id})消息: {user_name}: {message_text[:30]}...")
+    logger.debug(f"[记录员 V2] 已记录群({group_id})消息: {user_name}: {message_text[:50]}...")
     
     if user_id != bot.self_id:
-        # 为主动聊天增加消息计数
         data_store.increment_active_chat_message_count(group_id)
-        # 检查是否需要触发群聊摘要更新
         if data_store.increment_and_check_summary_trigger(group_id):
             asyncio.create_task(update_summary_for_group(group_id, list(history)))
 
-async def _describe_message_content_for_active_chat(bot: Bot, message: Message) -> str:
-    """为主动聊天历史记录，简单描述非纯文本消息。"""
-    if not message: return "[一条空消息]"
+async def format_message_for_history(bot: Bot, event: GroupMessageEvent) -> str:
+    """
+    将一条复杂的 GroupMessageEvent 转换成对AI友好的、包含上下文的单行文本。
+    - 能够解析并描述 @某人。
+    - 能够解析并描述 回复。
+    - 能够描述图片、表情等非文本内容。
+    """
+    message = event.message
+    full_text_parts = []
+
+    # 1. 处理引用回复 (reply)
+    if event.reply:
+        try:
+            replied_msg_info = await bot.get_msg(message_id=event.reply.message_id)
+            replied_sender_info = replied_msg_info.get('sender', {})
+            replied_user_id = replied_sender_info.get('user_id')
+            replied_user_name = replied_sender_info.get('card') or replied_sender_info.get('nickname', f'用户{replied_user_id}')
+            
+            # 简化被回复消息的内容
+            replied_content_raw = replied_msg_info.get('message', '')
+            replied_content = Message(replied_content_raw).extract_plain_text().strip()
+            if not replied_content:
+                # 如果没文本，就给个通用描述
+                replied_content = "[一条非文本消息]"
+            
+            # 构建回复部分的文本
+            reply_prefix = f"回复({replied_user_name}: “{replied_content[:20]}...”) "
+            full_text_parts.append(reply_prefix)
+
+        except Exception as e:
+            logger.warning(f"获取被回复消息({event.reply.message_id})失败: {e}, 无法在历史中构建引用上下文。")
+            full_text_parts.append("[回复了一条消息] ")
+
+    # 2. 遍历消息段，处理 @、文本和其他内容
     for seg in message:
-        if seg.type == 'image': return "[图片]"
-        if seg.type == 'face': return "[表情]"
-        if seg.type == 'record': return "[语音]"
-        if seg.type == 'json': return "[小程序/卡片]"
-    return "[一条非纯文本消息]"
+        if seg.type == 'text':
+            full_text_parts.append(seg.data.get('text', ''))
+        elif seg.type == 'at':
+            at_user_id = seg.data.get('qq')
+            if at_user_id == 'all':
+                full_text_parts.append('@全体成员 ')
+            else:
+                try:
+                    # 尝试获取被@用户的群名片
+                    user_info = await bot.get_group_member_info(group_id=event.group_id, user_id=int(at_user_id))
+                    user_name = user_info.get('card') or user_info.get('nickname', f'用户{at_user_id}')
+                    full_text_parts.append(f"@{user_name} ")
+                except Exception:
+                    full_text_parts.append(f"[@一位成员] ") # 获取失败时的兜底
+        elif seg.type == 'image':
+            full_text_parts.append('[图片]')
+        elif seg.type == 'face':
+            full_text_parts.append('[表情]')
+        elif seg.type == 'record':
+            full_text_parts.append('[语音]')
+        elif seg.type == 'json':
+            full_text_parts.append('[小程序/卡片]')
+        # 忽略 reply 段，因为它已经在前面处理过了
+        elif seg.type == 'reply':
+            continue
+        # 其他未处理类型
+        else:
+            full_text_parts.append(f"[{seg.type}]")
+            
+    final_text = "".join(full_text_parts).strip()
+    # 如果处理完还是空的（例如，消息只包含一个reply段），提供一个保底描述
+    return final_text if final_text else "[一条内容未知的消息]"
 
 # 2. 主动聊天决策者 (注意：这个就是你 `__init__.py` 文件末尾的 `active_chat_handler` 所调用的函数)
 # 我们把它放在这里，但让 `__init__.py` 来调用
