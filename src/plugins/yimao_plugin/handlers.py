@@ -191,8 +191,14 @@ async def handle_chat_session(bot: Bot, matcher: Matcher, event: Event, user_mes
                          item['text'] = f"{config.SLASH_COMMAND_SYSTEM_PROMPT}\n\n---\n\n{original_content.lstrip('/')}"
                          break
     else: 
-        model, system_prompt, use_function_calling = config.DEFAULT_MODEL_NAME, config.DEFAULT_SYSTEM_PROMPT_TEMPLATE, True
+        model, use_function_calling = config.DEFAULT_MODEL_NAME, True
         
+        # 检查是否为群聊且在特殊配置列表中
+        if isinstance(event, GroupMessageEvent) and str(event.group_id) in config.EMOTIONLESS_PROMPT_GROUP_IDS:
+            system_prompt = config.EMOTIONLESS_SYSTEM_PROMPT
+            logger.info(f"群组 {event.group_id} 在特殊配置中，使用无情感Prompt。")
+        else:
+            system_prompt = config.DEFAULT_SYSTEM_PROMPT_TEMPLATE        
     logger.info(f"会话 {session_id} (模式: {mode}) 收到请求。")
     try:
         max_turns = 5
@@ -302,7 +308,10 @@ async def handle_memory_command(matcher: Matcher, event: Event, args: Message = 
 
 
 async def handle_challenge_chat(bot: Bot, matcher: Matcher, event: Event):
-
+    # 【新增】用户黑名单检查
+    if str(event.user_id) in config.USER_BLACKLIST_IDS:
+        logger.info(f"用户 {event.user_id} 在黑名单中，已忽略其猜病挑战指令。")
+        await matcher.finish()
     # --- 1. 初始化与上下文获取 ---
     session_id = event.get_session_id()
     user_id_str = str(event.user_id)
@@ -600,6 +609,8 @@ async def _(bot: Bot, event: GroupMessageEvent):
     在任何功能被触发之前，就将所有群聊消息记录到历史中。
     【已升级】现在能正确处理 @ 和 回复。
     """
+    if str(event.user_id) in config.USER_BLACKLIST_IDS:
+        return # 不记录黑名单用户的消息
     # 只处理群聊消息
     if not isinstance(event, GroupMessageEvent):
         return

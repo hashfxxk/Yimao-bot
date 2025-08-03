@@ -78,6 +78,9 @@ async def _(bot: Bot, event: Event, matcher: Matcher):
 at_me_handler = on_message(rule=to_me(), priority=10, block=True)
 @at_me_handler.handle()
 async def _(bot: Bot, matcher: Matcher, event: Event): 
+    if str(event.user_id) in config.USER_BLACKLIST_IDS:
+        logger.info(f"用户 {event.user_id} 在黑名单中，已忽略其@消息。")
+        await matcher.finish() # 静默结束，不发送任何消息
     # 1. 获取纯文本内容，为指令解析做准备
     text = event.get_plaintext().strip()
     cmd_parts = text.split()
