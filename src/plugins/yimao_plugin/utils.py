@@ -66,9 +66,21 @@ async def send_long_message_as_forward(bot: Bot, event: Event, content: str, bot
             history.append(structured_message)
             logger.debug(f"[回写] 已记录机器人长消息到群({event.group_id})历史。")
 
+            # 【修复】在这里调用缓存函数，将发送成功的长消息内容进行缓存
+            if sent_receipt and 'message_id' in sent_receipt:
+                message_id = int(sent_receipt['message_id'])
+                data_store.cache_forward_content(message_id, content)
+
         else:
             # 私聊部分暂时不处理主动聊天，所以可以不写回
             sent_receipt = await bot.send_private_forward_msg(user_id=event.user_id, messages=forward_nodes)
+            
+            # 【修复】同样为私聊添加缓存逻辑，以备未来扩展
+            if sent_receipt and 'message_id' in sent_receipt:
+                message_id = int(sent_receipt['message_id'])
+                data_store.cache_forward_content(message_id, content)
+
+        return sent_receipt # 返回发送回执
         
     except Exception as e:
         logger.error(f"发送合并转发消息失败: {e}", exc_info=True)
